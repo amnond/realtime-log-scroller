@@ -1,0 +1,1001 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>O(1) Smart Scaling Virtual Scroller</title>
+    <style>
+          /* Page-level UI controls styling only. Component-specific layout
+             and scroller styles are injected at runtime by the VirtualScroller
+             constructor so this page-level stylesheet stays minimal and
+             non-invasive. */
+    </style>
+</head>
+<body>
+
+    <div>
+        <h2 style="text-align: center;">O(1) Smart Scaling Virtual Scroller Demo</h2>
+        <div style="text-align: center; margin-bottom: 10px;">
+            <button onclick="addItems(520)">Add 520 Random Log Lines</button>
+            <button onclick="scroller.clear()">Clear All</button>
+        </div>
+
+		<div style="text-align: center; margin-bottom: 10px; padding: 5px; border: 1px solid #ccc; background-color: #f7f7f7;">
+            <label for="search-input" style="font-weight: bold; margin-right: 5px;">Search (Regex):</label>
+            <input type="text" id="search-input" placeholder="Enter regex (e.g., error|warn)" 
+                   style="width: 250px; padding: 5px; border: 1px solid #aaa;">
+
+
+			<button id="pause-btn" onclick="scroller.pause()">Pause</button>
+            <button id="resume-btn" onclick="scroller.continue()">Resume</button>
+            
+            <button id="search-next-btn" style="margin-left: 10px; padding: 5px 15px;">Next ⬇️</button>
+            <button id="search-prev-btn" style="padding: 5px 15px;">Prev ⬆️</button>
+        </div>
+            
+    </div>
+
+    <div id="virtual-viewport">
+        <!-- Spacer provides the full scrollable height (controlled by JS).
+             We render visible items inside `#content-window` and translate it
+             vertically; the spacer keeps the scrollbar proportional to totalHeight. -->
+        <div id="spacer-element"></div>
+        <div id="content-window"></div>
+    </div>
+
+    <script>
+        // --- CONFIGURATION ---
+        const ESTIMATED_ITEM_HEIGHT = 60;
+        const OVERSCAN_COUNT = 10;
+
+        class VirtualScroller {
+            constructor(viewportId, opts = {}) {
+                // Accept only the viewport ID; auto-discover required child elements
+                const viewportElement = typeof viewportId === 'string' 
+                    ? document.getElementById(viewportId) 
+                    : viewportId;
+
+                if (!viewportElement) {
+                    throw new Error(`VirtualScroller: viewport element with ID "${viewportId}" not found`);
+                }
+
+                // Auto-discover required child elements by class or ID
+                this.viewport = viewportElement;
+                this.spacer = viewportElement.querySelector('.vs-spacer, #spacer-element');
+                this.contentWindow = viewportElement.querySelector('.vs-content-window, #content-window');
+
+                if (!this.spacer || !this.contentWindow) {
+                    throw new Error('VirtualScroller: viewport must contain .vs-spacer and .vs-content-window child elements');
+                }
+
+				// --- START: Single-Use Measurement Container ---
+				this.measurementContainer = document.createElement('div');
+				this.measurementContainer.style.position = 'absolute';
+				this.measurementContainer.style.visibility = 'hidden';
+				this.measurementContainer.style.top = '-9999px'; // Move far off-screen
+				this.measurementContainer.style.left = '0';
+				// Crucial: Set its width to match the viewport so text wraps correctly for measurement.
+				this.measurementContainer.style.width = `${this.viewport.clientWidth}px`; 
+				document.body.appendChild(this.measurementContainer);
+				// --- END: Single-Use Measurement Container ---
+
+
+				// --- Search related ---
+				this.searchRegex = null;      // Stores the compiled RegExp object for highlighting/searching
+				this.firstVisibleIndex = 0;   // Assumed to be tracked by the existing code
+				this.lastFoundIndex = -1;     // Tracks the last index found during search
+
+
+                // Optional: performance tuning parameters (with sensible defaults)
+                this.estimatedHeight = opts.estimatedHeight || ESTIMATED_ITEM_HEIGHT;
+                this.overscan = typeof opts.overscan === 'number' ? opts.overscan : OVERSCAN_COUNT;
+
+                this.items = [];
+                this.itemHeights = [];
+                // cumulativeHeights[i] = sum of itemHeights[0..i]
+                // This allows O(1) lookup of offsets and O(log n) binary search.
+                // We maintain and rebuild this cache only when heights change (resize/measurement).
+                this.cumulativeHeights = []; // cache cumulative heights for O(1) lookup
+                this.totalHeight = 0;
+
+                this.lastKnownViewportWidth = this.viewport.clientWidth;
+                // Track last scroll position and start index to enable incremental (O(1) avg)
+                // searches when the user scrolls small distances (typical for log viewers).
+                this.lastScrollTop = 0;
+                this.lastStartIndex = 0;
+                this.resizeTimer = null;
+                this.paused = false;
+
+                // Bindings
+                this._onScroll = this.renderVisibleItems.bind(this);
+                this._onResize = this.handleResize.bind(this);
+                this._onKeyDown = this.handleKeyDown.bind(this);
+
+                this.viewport.addEventListener('scroll', this._onScroll);
+                window.addEventListener('resize', this._onResize);
+                this.viewport.addEventListener('keydown', this._onKeyDown);
+
+                // Ensure viewport and related elements have classes the injected
+                // stylesheet can target. Also make the viewport keyboard-focusable
+                // so the `keydown` listener receives events without requiring the
+                // user to click it first.
+                try {
+                    this.viewport.classList.add('vs-viewport');
+                    this.spacer.classList.add('vs-spacer');
+                    this.contentWindow.classList.add('vs-content-window');
+                    if (!this.viewport.hasAttribute('tabindex')) this.viewport.setAttribute('tabindex', '0');
+                } catch (e) {
+                    // Defensive: if provided elements are not DOM nodes, skip.
+                }
+
+                // Inject component-scoped CSS once so the scroller is self-contained.
+                if (!document.getElementById('virtual-scroller-styles')) {
+                    const css = `
+                    /* VirtualScroller injected styles (scoped by class + legacy IDs).
+                        We purposely avoid touching html, body here to prevent a
+                        global CSS reset that could affect the rest of the page. */
+                    .vs-viewport, #virtual-viewport {
+                        width: 80%;
+                        min-width: 300px;
+                        max-width: 900px;
+                        margin: 20px auto 0;
+                        border: 1px solid #ccc;
+                        overflow-y: scroll;
+                        position: relative;
+                        box-sizing: border-box;
+                        resize: horizontal;
+                        background-color: #f9f9f9;
+                    }
+                    /* Visible focus outline for keyboard users */
+                    .vs-viewport:focus { outline: 2px solid #007bff; outline-offset: -2px; }
+                    .vs-content-window, #content-window {
+                        position: absolute;
+                        top: 0;
+                        left: 0;
+                        width: 100%;
+                        will-change: transform;
+                    }
+                    .vs-spacer, #spacer-element { width: 1px; height: 0; }
+                    .scroller-item, .vs-item {
+                        min-height: 40px;
+                        padding: 10px;
+                        border-bottom: 1px solid #eee;
+                        background-color: white;
+                        font-family: sans-serif;
+                        font-size: 14px;
+                    }
+                    .scroller-item strong { display: block; margin-bottom: 5px; }
+
+					 /* Standard match color for search */
+					.search-highlight {
+					    background-color: cyan;
+					    color: black;
+					}
+
+					/* Color for the currently focused search result */
+					.search-found {
+					    background-color: blue;
+					    color: yellow;
+					}
+                    
+                    `;
+
+                    const style = document.createElement('style');
+                    style.id = 'virtual-scroller-styles';
+                    style.textContent = css;
+                    document.head.appendChild(style);
+                }
+
+                // Initialize size
+                this.updateViewportSize();
+            }
+
+			/**
+		     * Highlights all matches of the given regex string in the visible area.
+		     * Clears highlights if regexstr is null or empty.
+		     * @param {string} regexstr - The regex string to search for (e.g., "error|warn").
+		     */
+		    highlightRegex(regexstr) {
+		        if (!regexstr) {
+		            this.searchRegex = null; // Clear existing highlight
+		            this.lastFoundIndex = -1;
+		            this.renderVisibleItems();
+		            return;
+		        }
+
+		        // Use 'gi' flags: 'g' (Global) for finding all matches, 'i' (Case-Insensitive)
+		        try {
+		            this.searchRegex = new RegExp(regexstr, 'gi');
+		            // Reset the last found index for a new search
+		            this.lastFoundIndex = -1; 
+		            this.renderVisibleItems(); // Trigger re-render to apply highlights
+		        } catch (e) {
+		            console.error("Invalid regular expression:", e);
+		            this.searchRegex = null;
+		            this.renderVisibleItems();
+		        }
+		    }
+
+			/**
+		     * Finds the index of the next item matching the regex, and scrolls to it.
+		     * @param {string} regexstr - The regex string.
+		     * @returns {number} The index of the found item, or -1 if no match is found.
+		     */
+		    nextIndexForRegex(regexstr) {
+		        if (!regexstr) return -1;
+
+		        try {
+		            const regex = new RegExp(regexstr, 'i');
+		            
+		            let startIndex;
+		            
+		            // Check for scroll jump: If the last match is behind the current viewport, reset the search start to the viewport.
+		            // If the last match is ahead or at the viewport, continue from the next item.
+		            if (this.lastFoundIndex >= 0 && this.lastFoundIndex >= this.firstVisibleIndex) {
+		                startIndex = this.lastFoundIndex + 1; 
+		            } else {
+		                // New search or scrolled past the last match. Start search from the current viewport position.
+		                startIndex = this.firstVisibleIndex;
+		            }
+		            
+		            for (let i = startIndex; i < this.items.length; i++) {
+		                if (regex.test(this.items[i])) {
+		                    this._scrollToItem(i); 
+		                    return i;
+		                }
+		            }
+
+		            // Wrap Around Logic: Check from the very beginning (index 0) up to the starting point.
+		            for (let i = 0; i < startIndex; i++) {
+		                if (regex.test(this.items[i])) {
+		                    this._scrollToItem(i);
+		                    return i;
+		                }
+		            }
+		            
+		            this.lastFoundIndex = -1;
+		            return -1;
+		        } catch (e) {
+		            console.error("Invalid regular expression:", e);
+		            return -1;
+		        }
+		    }
+
+			/**
+		     * Finds the index of the previous item matching the regex, and scrolls to it.
+		     * The search is done in two passes to correctly handle scroll jumps.
+		     * @param {string} regexstr - The regex string.
+		     * @returns {number} The index of the found item, or -1 if no match is found.
+		     */
+		    prevIndexForRegex(regexstr) {
+		        if (!regexstr) return -1;
+
+		        try {
+		            const regex = new RegExp(regexstr, 'i');
+		            
+		            let searchStart;
+		            let searchBreakPoint; // The index where the search should temporarily stop.
+
+		            if (this.lastFoundIndex >= 0 && this.lastFoundIndex <= this.firstVisibleIndex + 1) {
+		                // 1. HOT SEARCH: Actively clicking 'Prev' near the current view.
+		                searchStart = this.lastFoundIndex - 1;
+		                searchBreakPoint = -1; // Search all the way to index 0.
+		            } else {
+		                // 2. COLD/SCROLL-AWAY SEARCH: The last match is far away (or none yet).
+		                // This means the user expects the search to start from the end of their visible view.
+		                
+		                // Start search from the LAST known match, or the end of the current viewport, whichever is higher.
+		                // We use the full item length as a starting proxy if no match is set yet.
+		                searchStart = this.lastFoundIndex >= 0 ? this.lastFoundIndex - 1 : this.firstVisibleIndex; 
+		                
+		                // The search should stop just before the current viewport starts.
+		                searchBreakPoint = this.firstVisibleIndex; 
+
+		                // Ensure searchStart is not less than searchBreakPoint (this prevents the initial skip).
+		                // If lastFoundIndex was 100, but firstVisibleIndex is 500, searchStart becomes 99 and searchBreakPoint is 500.
+		                // We MUST set the start point high enough to search the items 500-N.
+		                if (searchStart < searchBreakPoint) {
+		                    searchStart = this.items.length - 1; // Search from the end of the list if we scrolled past the last match.
+		                }
+		            }
+		            
+		            // --- PASS 1: Search Backward from the determined start point down to the break point ---
+		            for (let i = searchStart; i >= searchBreakPoint; i--) {
+		                if (regex.test(this.items[i])) {
+		                    this._scrollToItem(i);
+		                    return i;
+		                }
+		            }
+		            
+		            // --- PASS 2: Wrap Around/Secondary Search ---
+		            // This checks the rest of the items, effectively looping around to the top of the list (0) 
+		            // if the primary search started from the bottom (searchBreakPoint > 0).
+		            if (searchBreakPoint > 0) {
+		                for (let i = searchBreakPoint - 1; i >= 0; i--) {
+		                    if (regex.test(this.items[i])) {
+		                        this._scrollToItem(i);
+		                        return i;
+		                    }
+		                }
+		            }
+
+		            this.lastFoundIndex = -1;
+		            return -1;
+		        } catch (e) {
+		            console.error("Invalid regular expression:", e);
+		            return -1;
+		        }
+		    }
+		    
+			/**
+		     * Private helper to scroll the viewport to the item at the given index,
+		     * ensuring it is fully visible near the top of the view.
+		     * @param {number} index - The index of the item to scroll to.
+		     */
+		    _scrollToItem(index) {
+		        if (index >= 0 && index < this.items.length) {
+		            // Use the offset (item's top position) calculated by the virtualizer.
+		            const itemTopOffset = this.getOffsetForIndex(index);
+		            
+		            // Apply a small buffer (e.g., 20px) to scroll past the exact top, 
+		            // ensuring the item is comfortably visible and not covered by UI.
+		            const buffer = 20; 
+		            const targetScrollTop = itemTopOffset - buffer;
+		            
+		            // Set the scroll position
+		            this.viewport.scrollTop = Math.max(0, targetScrollTop);
+
+		            // Update state and CRITICAL: Force a synchronous re-render.
+		            // This ensures the correct items are loaded into the DOM and the 'search-found' class is applied instantly.
+		            this.lastFoundIndex = index;
+		            this.renderVisibleItems(); 
+		        }
+		    }
+    
+            updateViewportSize() {
+                // Compute available height from the viewport's top edge down to the window bottom.
+                // Set max-height instead of forcing a fixed height so the scroller's internal
+                // spacer doesn't push the document taller than the window.
+                const rect = this.viewport.getBoundingClientRect();
+                // Subtract the document body's top margin to be independent from
+                // page-level margins. This makes the scroller compute available
+                // height correctly even when the host page has non-zero body margin.
+                const bodyStyle = window.getComputedStyle && window.getComputedStyle(document.body);
+                const bodyMarginTop = bodyStyle ? parseFloat(bodyStyle.marginTop) || 0 : 0;
+                // Adjusted top relative to the body's inner content area
+                const top = Math.max(0, Math.floor(rect.top - bodyMarginTop));
+                // bottomGap provides a safety margin to avoid off-by-a-few-pixels causing
+                // the main document to overflow (browsers may round sub-pixel values).
+                const bottomGap = 50; // small safety gap to avoid off-by-a-few-pixels overflow
+                const minHeight = 40;
+                const available = Math.max(minHeight, Math.floor(window.innerHeight - top - bottomGap));
+
+                // Apply a conservative max-height; only shrink the actual height if it exceeds available.
+                this.viewport.style.maxHeight = `${available}px`;
+                if (this.viewport.clientHeight > available) {
+                    this.viewport.style.height = `${available}px`;
+                } else {
+                    // allow the element to use its natural size (CSS) when it's smaller than available
+                    this.viewport.style.height = '';
+                }
+            }
+
+
+			// Inside VirtualScroller class...
+			add_html(html_str) {
+			    this.items.push(html_str);
+
+			    // --- START: Reused Measurement Logic (as in original code) ---
+			    let actualHeight;
+			    try {
+			        const container = this.measurementContainer;
+			        container.style.width = `${this.viewport.clientWidth}px`; 
+			        container.innerHTML = html_str;
+			        actualHeight = container.firstChild ? container.firstChild.offsetHeight : this.estimatedHeight;
+			        container.innerHTML = '';
+			    } catch (e) {
+			        console.error("Failed to measure item height, using estimate.", e);
+			        actualHeight = this.estimatedHeight;
+			    }
+			    // --- END: Reused Measurement Logic ---
+
+			    const newHeight = Math.max(1, actualHeight);
+
+			    this.itemHeights.push(newHeight);
+			    this.totalHeight += newHeight;
+
+			    // Update cumulative heights incrementally (O(1)).
+			    const prevCumulative = this.cumulativeHeights.length > 0 ? this.cumulativeHeights[this.cumulativeHeights.length - 1] : 0;
+			    this.cumulativeHeights.push(prevCumulative + newHeight);
+
+			    this.updateSpacerHeight();
+			    
+			    // --- MODIFIED SCROLL LOGIC STARTS HERE ---
+			    if (!this.paused) {
+			        // Calculate the maximum possible scroll position (the bottom of the content)
+			        // using the new total height and the viewport's height.
+			        const maxScroll = Math.max(0, this.totalHeight - this.viewport.clientHeight);
+			        
+			        // Check if the user is already viewing the bottom of the logs, OR if the new
+			        // item pushes the content just past the current scroll position.
+			        // A simple check like: this.viewport.scrollTop >= maxScroll - this.estimatedHeight * 2 
+			        // will preserve user's position when they are looking at older logs.
+			        //
+			        // TO ALWAYS SCROLL TO THE BOTTOM WHEN NEW ITEM IS ADDED:
+			        
+			        // 1. Force a re-render to ensure the new item's block is loaded.
+			        this.renderVisibleItems();
+			        
+			        // 2. Calculate the maximum scroll position *after* the spacer height has been updated.
+			        // We use the spacer height directly as it's the source of truth for the scrollbar.
+			        const maxScrollAfterUpdate = Math.max(0, this.spacer.offsetHeight - this.viewport.clientHeight);
+
+			        // 3. Set scrollTop to the maximum value to ensure the new item is visible.
+			        this.viewport.scrollTop = maxScrollAfterUpdate;
+			    }
+			    // --- MODIFIED SCROLL LOGIC ENDS HERE ---
+			}            
+			
+            pause() {
+                this.paused = true;
+            }
+
+            continue() {
+                this.paused = false;
+                this.renderVisibleItems();
+            }
+
+            clear() {
+                this.items = [];
+                this.itemHeights = [];
+                this.cumulativeHeights = [];
+                this.totalHeight = 0;
+                this.updateSpacerHeight();
+                this.contentWindow.innerHTML = '';
+                this.renderVisibleItems();
+            }
+
+            getOffsetForIndex(index) {
+                // O(1) lookup using cumulative heights cache.
+                // Returns the pixel offset from the top of the spacer to the start of item `index`.
+                // If cumulativeHeights is empty or index is 0, offset is 0.
+                if (index <= 0) return 0;
+                return this.cumulativeHeights[index - 1] || 0;
+             }
+
+            updateSpacerHeight() {
+                this.spacer.style.height = `${this.totalHeight}px`;
+            }
+
+			/**
+		     * Private helper to slice the item array, apply regex highlighting, and join the result.
+		     * @param {number} startIndex - The starting index of the slice.
+		     * @param {number} endIndex - The ending index of the slice (exclusive).
+		     * @returns {string} The HTML string ready for innerHTML insertion.
+		     */
+		    _getHighlightedHtml(startIndex, endIndex) {
+		        if (!this.searchRegex) {
+		            // Fast path: No search is active, return raw HTML string.
+		            return this.items.slice(startIndex, endIndex).join('');
+		        }
+
+		        // Search is active: Map over the array to apply highlighting.
+		        return this.items.slice(startIndex, endIndex).map((itemHtml, index) => {
+		            const itemIndex = startIndex + index; // The absolute index in this.items
+		            
+		            // Distinguish the currently found item (scrolled to) from other matches.
+		            const highlightClass = (itemIndex === this.lastFoundIndex) ? 'search-found' : 'search-highlight';
+		            
+		            // Apply the highlight using String.prototype.replace.
+		            // Note: The 'g' flag on this.searchRegex ensures all matches in the item are replaced.
+		            return itemHtml.replace(this.searchRegex, (match) => {
+		                return `<mark class="${highlightClass}">${match}</mark>`;
+		            });
+		        }).join('');
+		    }            
+
+
+			/**
+		     * Performs DOM element checks to ensure the rendered block is correctly intersecting the viewport.
+		     * @param {number} startIndex - The starting index of the rendered block.
+		     * @param {number} endIndex - The ending index of the rendered block.
+		     * @returns {{renderedOK: boolean, failureReason: string, expectedRenderedCount: number, actualRenderedCount: number}}
+		     */
+		    _checkRenderSafety(startIndex, endIndex) {
+		        const expectedRenderedCount = endIndex - startIndex;
+		        const actualRenderedCount = this.contentWindow.children.length;
+		        let renderedOK = true;
+		        let failureReason = null;
+
+		        if (actualRenderedCount !== expectedRenderedCount) {
+		            renderedOK = false;
+		            failureReason = `rendered count mismatch (expected ${expectedRenderedCount}, got ${actualRenderedCount})`;
+		        }
+
+		        let firstChild = this.contentWindow.children[0];
+		        let lastChild = this.contentWindow.children[this.contentWindow.children.length - 1];
+
+		        if (firstChild && lastChild) {
+		            const viewportRect = this.viewport.getBoundingClientRect();
+		            const firstRect = firstChild.getBoundingClientRect();
+		            const lastRect = lastChild.getBoundingClientRect();
+		            const isOffScreen = lastRect.bottom < viewportRect.top || firstRect.top > viewportRect.bottom;
+		            if (isOffScreen) {
+		                renderedOK = false;
+		                failureReason = 'rendered block is off-screen';
+		            }
+		        }
+		        return { renderedOK, failureReason, expectedRenderedCount, actualRenderedCount };
+		    }
+
+		    /**
+		     * Handles the case where the primary render path failed safety verification.
+		     * Fallbacks to binary search with strict targeting and re-renders.
+		     * Note: Original logging logic for failure reason is omitted here for brevity, 
+		     * but the details are available in the check and should be included in your console.warn.
+		     */
+		    _handleRenderFailure(oldStartIndex, oldEndIndex, scrollTop, expectedCount, actualCount) {
+		        // Log detailed warning to help debug rare cases
+		        console.warn('VirtualScroller: render verification failed — falling back to binary search', {
+		            // ... (log details from original code) ...
+		        });
+
+		        // Recompute precisely using binary search and re-render (strict mode).
+		        const { startIndex: newStartIndex, endIndex: newEndIndex } = 
+		            this._calculateRenderRange(scrollTop, 'binarySearchIndex', true);
+
+		        this._renderContent(newStartIndex, newEndIndex);
+		        this.measureHeights(newStartIndex, newEndIndex);
+		        
+		        return { startIndex: newStartIndex, endIndex: newEndIndex };
+		    }
+
+		    /**
+		     * Handles the case where heights were measured and the optimal endIndex needs correction.
+		     */
+		    _handleCacheInvalidation(startIndex, endIndex, estimateForRange, VIEWPORT_HEIGHT) {
+		        // Re-check if we need to render more/fewer items based on newly measured heights.
+		        let newEndIndex = startIndex;
+		        let recomputedHeight = 0;
+		        const recomputeTargetHeight = VIEWPORT_HEIGHT + (2 * this.overscan * estimateForRange);
+		        
+		        while (newEndIndex < this.items.length && recomputedHeight < recomputeTargetHeight) {
+		            recomputedHeight += this.itemHeights[newEndIndex];
+		            newEndIndex++;
+		        }
+		        newEndIndex = Math.min(this.items.length, newEndIndex);
+		        
+		        const change = Math.abs(newEndIndex - endIndex);
+		        const SMALL_CHANGE = 3;
+		        
+		        if (newEndIndex !== endIndex) {
+		            const oldEndIndex = endIndex;
+		            if (change > SMALL_CHANGE) {
+		                // Log large changes (original logging logic).
+		                console.warn('VirtualScroller: endIndex changed after height measurement — re-rendering', {
+		                    // ... (log details from original code) ...
+		                });
+		            }
+		            
+		            // Apply the change and re-render
+		            endIndex = newEndIndex;
+		            this._renderContent(startIndex, endIndex); // <-- Re-render with new range
+		            this.measureHeights(startIndex, endIndex); // Re-measure new content
+		        }
+		        
+		        return { endIndex };
+		    }
+
+			/**
+		     * Calculates the required startIndex and endIndex for the viewport given the scroll position.
+		     * @param {number} scrollTop - The current scroll position.
+		     * @param {string} searchMethod - 'incrementalSearchIndex' or 'binarySearchIndex'.
+		     * @param {boolean} strictMode - True for stricter targeting (used in failure fallback).
+		     * @returns {{startIndex: number, endIndex: number, estimateForRange: number, targetHeight: number}}
+		     */
+		    _calculateRenderRange(scrollTop, searchMethod, strictMode = false) {
+		        let startIndex = this[searchMethod](scrollTop);
+		        startIndex = Math.max(0, startIndex - this.overscan);
+
+		        let estimateForRange = this.estimatedHeight;
+		        const VIEWPORT_HEIGHT = this.viewport.clientHeight;
+
+		        // Compute robust average item height for the range (original logic).
+		        if (this.itemHeights && this.itemHeights.length > startIndex) {
+		            const sampleCount = Math.min(20, this.itemHeights.length - startIndex);
+		            if (sampleCount > 0) {
+		                let sum = 0;
+		                for (let s = 0; s < sampleCount; s++) sum += this.itemHeights[startIndex + s] || this.estimatedHeight;
+		                estimateForRange = Math.max(1, Math.round(sum / sampleCount));
+		            }
+		        }
+
+		        // Determine target height based on mode (strict mode increases overscan factor).
+		        const overscanFactor = strictMode ? 3 : 2;
+		        const targetHeight = VIEWPORT_HEIGHT + (overscanFactor * this.overscan * estimateForRange);
+
+		        let currentHeight = 0;
+		        let endIndex = startIndex;
+		        while (endIndex < this.items.length && currentHeight < targetHeight) {
+		            currentHeight += this.itemHeights[endIndex];
+		            endIndex++;
+		        }
+		        endIndex = Math.min(this.items.length, endIndex);
+
+		        return { startIndex, endIndex, estimateForRange, targetHeight, VIEWPORT_HEIGHT };
+		    }
+
+		    /**
+		     * Renders the HTML content for the calculated range, applies the CSS transform, and includes highlighting.
+		     * @param {number} startIndex - The starting index of the content to render.
+		     * @param {number} endIndex - The ending index (exclusive).
+		     */
+		    _renderContent(startIndex, endIndex) {
+		        const offset = this.getOffsetForIndex(startIndex);
+		        this.contentWindow.style.transform = `translateY(${offset}px)`;
+		        
+		        // Integration of _getHighlightedHtml helper
+		        const finalHtml = this._getHighlightedHtml(startIndex, endIndex);
+		        this.contentWindow.innerHTML = finalHtml;
+		    }
+
+			/**
+		     * Orchestrates the rendering cycle: calculates range, renders content,
+		     * measures heights, and handles failure/correction cases.
+		     */
+		    renderVisibleItems() {
+		        if (!this.viewport) return;
+		        const scrollTop = this.viewport.scrollTop;
+		        const VIEWPORT_HEIGHT = this.viewport.clientHeight;
+
+		        // 1. Calculate the initial render range (using fast incremental search).
+		        let { startIndex, endIndex, estimateForRange } = 
+		            this._calculateRenderRange(scrollTop, 'incrementalSearchIndex', false);
+
+		        // Update the cached visible index for search functions.
+		        this.firstVisibleIndex = startIndex; 
+
+		        // 2. Render Content (Primary Path) and measure initial heights.
+		        this._renderContent(startIndex, endIndex);
+		        const cacheWasInvalidated = this.measureHeights(startIndex, endIndex);
+
+		        // 3. Safety Verification: Check if the content is aligned and correct.
+		        const { renderedOK, expectedRenderedCount, actualRenderedCount } = 
+		            this._checkRenderSafety(startIndex, endIndex);
+		        
+		        // 4. Handle Failures or Cache Invalidation.
+		        if (!renderedOK) {
+		            // Path A: Fallback to strict binary search re-render.
+		            const result = this._handleRenderFailure(startIndex, endIndex, scrollTop, expectedRenderedCount, actualRenderedCount);
+		            startIndex = result.startIndex;
+		            endIndex = result.endIndex;
+		        } else if (cacheWasInvalidated) {
+		            // Path B: Re-check and potentially re-render if measured heights changed the optimal endIndex.
+		            const result = this._handleCacheInvalidation(startIndex, endIndex, estimateForRange, VIEWPORT_HEIGHT);
+		            endIndex = result.endIndex;
+		        }
+
+		        // 5. Cache state for the next scroll event.
+		        this.lastScrollTop = scrollTop;
+		        this.lastStartIndex = startIndex;
+		    }
+
+		    
+            incrementalSearchIndex(scrollTop) {
+                // O(1) average case: scan incrementally from last position
+                // Fall back to binary search for large jumps
+                const delta = Math.abs(scrollTop - this.lastScrollTop);
+                const avgHeight = this.estimatedHeight;
+                const maxIncrementalDistance = avgHeight * 50; // scan up to ~50 items
+
+                if (delta <= maxIncrementalDistance) {
+                    // Incremental scan from last position
+                    return this.incrementalSearchFrom(scrollTop, this.lastStartIndex);
+                } else {
+                    // Large jump: use binary search
+                    console.warn('VirtualScroller: large scroll jump detected, using binary search');
+                    return this.binarySearchIndex(scrollTop);
+                }
+            }
+
+            incrementalSearchFrom(scrollTop, startGuess) {
+                // Start from a sensible guess (the previous start index). For scrolling
+                // down we scan forward from that guess; for scrolling up we scan
+                // backward from that guess. This avoids starting far away which
+                // could otherwise skip the correct range and produce incorrect
+                // render offsets.
+                if (!this.cumulativeHeights || this.cumulativeHeights.length === 0) return 0;
+
+                // Clamp the start guess to the valid range
+                let index = Math.max(0, Math.min(startGuess, this.cumulativeHeights.length - 1));
+
+                if (scrollTop >= this.lastScrollTop) {
+                    // Scrolling down: scan forward from the guess. This typically
+                    // only moves a few items forward for normal scrolling.
+                    // Find first index where cumulativeHeights[index] >= scrollTop
+                    while (index < this.cumulativeHeights.length && this.cumulativeHeights[index] < scrollTop) {
+                        index++;
+                    }
+                } else {
+                    // Scrolling up: scan backward from the guess to find the correct boundary.
+                    // We need to find the first index where cumulativeHeights[index] >= scrollTop.
+                    // If the current index's cumulative is < scrollTop, we've gone too far back,
+                    // so scan forward. Otherwise, keep scanning back while safe.
+                    if (index > 0 && this.cumulativeHeights[index] < scrollTop) {
+                        // We're before the boundary, scan forward
+                        while (index < this.cumulativeHeights.length && this.cumulativeHeights[index] < scrollTop) {
+                            index++;
+                        }
+                    } else {
+                        // Scan backward while cumulativeHeights[index - 1] >= scrollTop
+                        while (index > 0 && this.cumulativeHeights[index - 1] >= scrollTop) {
+                            index--;
+                        }
+                    }
+                }
+
+                return index;
+            }
+
+            binarySearchIndex(scrollTop) {
+                // Binary search in cumulativeHeights to find first item whose cumulative height >= scrollTop
+                let left = 0, right = this.cumulativeHeights.length;
+                while (left < right) {
+                    const mid = Math.floor((left + right) / 2);
+                    if (this.cumulativeHeights[mid] < scrollTop) {
+                        left = mid + 1;
+                    } else {
+                        right = mid;
+                    }
+                }
+                return left;
+            }
+
+            measureHeights(startIndex, endIndex) {
+                const renderedElements = this.contentWindow.children;
+                let dirty = false;
+
+                for (let i = 0; i < renderedElements.length; i++) {
+                    const element = renderedElements[i];
+                    const itemIndex = startIndex + i;
+                    const actualHeight = element.offsetHeight;
+                    const oldHeight = this.itemHeights[itemIndex];
+
+                    if (oldHeight !== actualHeight) {
+                        this.itemHeights[itemIndex] = actualHeight;
+                        this.totalHeight = this.totalHeight - oldHeight + actualHeight;
+                        // Invalidate cumulative heights cache on any height change
+                        dirty = true;
+                    }
+                }
+
+                if (dirty) {
+                    this.rebuildCumulativeHeights();
+                    this.updateSpacerHeight();
+                }
+                
+                // Return whether the cache was invalidated (so caller can re-verify if needed)
+                return dirty;
+             }
+
+            rebuildCumulativeHeights() {
+                // Rebuild cumulative heights cache when any item height changes
+                this.cumulativeHeights = [];
+                let cumulative = 0;
+                for (let i = 0; i < this.itemHeights.length; i++) {
+                    cumulative += this.itemHeights[i];
+                    this.cumulativeHeights.push(cumulative);
+                }
+            }
+
+            handleKeyDown(event) {
+                // Handle keyboard navigation: Page Up/Down, Ctrl+Home/End, arrow keys.
+                // These allow users to scroll without touching the mouse.
+                // Helper: compute a robust maximum scrollTop using the spacer's
+                // current offsetHeight (more reliable than `totalHeight` when
+                // measurements update asynchronously).
+                const maxScroll = Math.max(0, ((this.spacer && this.spacer.offsetHeight) ? this.spacer.offsetHeight : this.totalHeight) - this.viewport.clientHeight);
+
+                switch (event.key) {
+                    case 'PageUp':
+                        // Scroll up by one viewport height
+                        event.preventDefault();
+                        this.viewport.scrollTop = Math.max(0, this.viewport.scrollTop - this.viewport.clientHeight);
+                        break;
+                    case 'PageDown':
+                        // Scroll down by one viewport height
+                        event.preventDefault();
+                        this.viewport.scrollTop = Math.min(
+                            maxScroll,
+                            this.viewport.scrollTop + this.viewport.clientHeight
+                        );
+                        break;
+                    case 'Home':
+                        // Ctrl+Home jumps to the start
+                        if (event.ctrlKey) {
+                            event.preventDefault();
+                            this.viewport.scrollTop = 0;
+                        }
+                        break;
+                    case 'End':
+                        // Ctrl+End jumps to the end
+                        if (event.ctrlKey) {
+                            event.preventDefault();
+                            this.viewport.scrollTop = maxScroll;
+                        }
+                        break;
+                    case 'ArrowUp':
+                        // Scroll up by a small amount (half estimated line height)
+                        event.preventDefault();
+                        this.viewport.scrollTop = Math.max(0, this.viewport.scrollTop - this.estimatedHeight / 2);
+                        break;
+                    case 'ArrowDown':
+                        // Scroll down by a small amount (half estimated line height)
+                        event.preventDefault();
+                        this.viewport.scrollTop = Math.min(
+                            maxScroll,
+                            this.viewport.scrollTop + this.estimatedHeight / 2
+                        );
+                        break;
+                }
+            }
+
+            handleResize() {
+                this.updateViewportSize();
+                const currentWidth = this.viewport.clientWidth;
+                if (currentWidth === this.lastKnownViewportWidth) return;
+
+                const currentScrollTop = this.viewport.scrollTop;
+                clearTimeout(this.resizeTimer);
+
+                this.resizeTimer = setTimeout(() => {
+                    this.updateViewportSize();
+                    const scaleFactor = this.lastKnownViewportWidth / currentWidth;
+                    let newTotalHeight = 0;
+
+                    for (let i = 0; i < this.itemHeights.length; i++) {
+                        const scaledHeight = this.itemHeights[i] * scaleFactor;
+                        this.itemHeights[i] = scaledHeight;
+                        newTotalHeight += scaledHeight;
+                    }
+
+                    this.totalHeight = newTotalHeight;
+                    this.lastKnownViewportWidth = currentWidth;
+                    const newScrollTop = currentScrollTop * scaleFactor;
+
+                    // Rebuild cumulative heights after resize
+                    this.rebuildCumulativeHeights();
+                    // Reset position trackers since heights changed
+                    this.lastScrollTop = newScrollTop;
+                    this.lastStartIndex = 0;
+                    this.updateSpacerHeight();
+                    this.renderVisibleItems();
+                    this.viewport.scrollTop = newScrollTop;
+                }, 100);
+            }
+
+            getDebugInfo() {
+                // Return debugging information about the current scroller state.
+                // Developers can call this to display or log scroller metrics.
+                const scrollTop = this.viewport.scrollTop;
+                const startIndex = this.lastStartIndex;
+                const endIndex = Math.min(this.items.length, startIndex + Math.ceil(this.viewport.clientHeight / this.estimatedHeight) + this.overscan);
+                return {
+                    totalItems: this.items.length,
+                    totalHeight: this.totalHeight,
+                    viewportHeight: this.viewport.clientHeight,
+                    scrollTop: scrollTop,
+                    visibleRange: `${startIndex} - ${endIndex}`,
+                    renderingItems: Math.max(0, endIndex - startIndex),
+                    paused: this.paused
+                };
+            }
+        }
+
+        // Instantiate the scroller with only the viewport ID; all child elements are auto-discovered
+        const scroller = new VirtualScroller('virtual-viewport', {
+            estimatedHeight: ESTIMATED_ITEM_HEIGHT,
+            overscan: OVERSCAN_COUNT
+        });
+
+        // helper to add many items for demo with random heights, colors, and text
+        function addItems(n) {
+            // Word pool for generating random text
+            const words = ['lorem', 'ipsum', 'dolor', 'sit', 'amet', 'consectetur', 'adipiscing', 'elit', 'sed', 'do', 'eiusmod', 'tempor', 'incididunt', 'ut', 'labore', 'et', 'dolore', 'magna', 'aliqua', 'enim', 'ad', 'minim', 'veniam', 'quis', 'nostrud', 'exercitation', 'ullamco', 'laboris', 'nisi', 'aliquip', 'ex', 'ea', 'commodo', 'consequat'];
+            
+            // Color palette for variety
+            const colors = ['#ff6b6b', '#4ecdc4', '#45b7d1', '#f9ca24', '#6c5ce7', '#a29bfe', '#fd79a8', '#fdcb6e', '#74b9ff', '#81ecec'];
+            
+            function generateRandomWords(count) {
+                let text = '';
+                for (let j = 0; j < count; j++) {
+                    const word = words[Math.floor(Math.random() * words.length)];
+                    text += word + ' ';
+                }
+                return text.trim();
+            }
+            
+            for (let i = 0; i < n; i++) {
+                // Random height between 40px and 180px
+                const height = Math.floor(Math.random() * 140) + 40;
+                // Random color
+                const color = colors[Math.floor(Math.random() * colors.length)];
+                // Random number of words (3 to 15 words)
+                const wordCount = Math.floor(Math.random() * 13) + 3;
+                const text = generateRandomWords(wordCount);
+                
+                const html = `<div class="scroller-item" style="height: ${height}px; background-color: ${color}; display: flex; align-items: center; padding: 10px; overflow: hidden; box-sizing: border-box;"><span style="color: white; font-weight: bold; margin-right: 8px;">#${scroller.items.length + 1}</span><span style="color: white; font-size: 14px;">${text}</span></div>`;
+                scroller.add_html(html);
+            }
+        }
+
+        // Initialize with some items
+        addItems(30);
+
+
+		// --- Search Functionality Event Listeners ---
+		(function() {
+		    const searchInput = document.getElementById('search-input');
+		    const nextButton = document.getElementById('search-next-btn');
+		    const prevButton = document.getElementById('search-prev-btn');
+
+		    // 1. Highlight Regex on Input Change (Real-time highlighting)
+		    searchInput.addEventListener('input', function() {
+		        const regexStr = this.value;
+		        // Calls the new highlightRegex method to compile the regex and re-render the visible area.
+		        scroller.highlightRegex(regexStr);
+		    });
+
+		    // 2. Search Next Button Handler
+		    nextButton.addEventListener('click', function() {
+		        const regexStr = searchInput.value;
+		        if (regexStr) {
+		            // Calls the new nextIndexForRegex method, which searches and scrolls.
+		            scroller.nextIndexForRegex(regexStr);
+		        }
+		    });
+
+		    // 3. Search Previous Button Handler
+		    prevButton.addEventListener('click', function() {
+		        const regexStr = searchInput.value;
+		        if (regexStr) {
+		            // Calls the new prevIndexForRegex method, which searches and scrolls.
+		            scroller.prevIndexForRegex(regexStr);
+		        }
+		    });
+
+		    // Optional: Add a listener for the Enter key to jump to the next match quickly
+		    searchInput.addEventListener('keydown', function(event) {
+		        if (event.key === 'Enter') {
+		            event.preventDefault(); // Prevent form submission or newline
+		            const regexStr = this.value;
+		            if (regexStr) {
+		                 // Use the 'Next' logic for the Enter key
+		                scroller.nextIndexForRegex(regexStr);
+		            }
+		        }
+		    });
+		})();
+
+
+        // --- SSE Integration: receive log lines from /stream and append ---
+        try {
+            const logSSE = new EventSource('/stream');
+
+            logSSE.onmessage = function(event) {
+                const text = event.data;
+                const html = `<div class="scroller-item">${text}</div>`;
+                scroller.add_html(html);
+            };
+
+            logSSE.onerror = function(err) {
+                console.error('EventSource error:', err);
+            };
+        } catch (e) {
+            console.warn('SSE not supported or failed to initialize', e);
+        }
+
+    </script>
+</body>
+</html>
