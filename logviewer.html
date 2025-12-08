@@ -634,7 +634,9 @@
 		     */
 		    _renderContent(startIndex, endIndex) {
 		        const offset = this.getOffsetForIndex(startIndex);
-		        this.contentWindow.style.transform = `translateY(${offset}px)`;
+		        //this.contentWindow.style.transform = `translateY(${offset}px)`;
+				this.contentWindow.style.transform = '';
+				this.contentWindow.style.top = `${offset}px`;
 		        
 		        // Integration of _getHighlightedHtml helper
 		        const finalHtml = this._getHighlightedHtml(startIndex, endIndex);
