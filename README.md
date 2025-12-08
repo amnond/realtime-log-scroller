@@ -116,3 +116,5 @@ The system renders an **overscan buffer** (an extra 10 items above and 10 below 
 
 The JavaScript logic only intervenes to **re-render and reposition** the content block *before* the user scrolls past the edge of the overscan buffer. Because the swap happens while the viewport is still full of relevant content, the user never sees the empty space of the `#spacer-element`, which prevents visible jumps or flickers.
 
+## Implementation Notes
+* Earlier versions used transform for positioning and included will-change: transform. Since layout positioning (top) is now used to preserve correct text selection, the will-change hint is intentionally omitted to avoid unnecessary compositing.
