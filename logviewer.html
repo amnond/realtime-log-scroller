@@ -25,14 +25,15 @@
             <label for="search-input" style="font-weight: bold; margin-right: 5px;">Search (Regex):</label>
             <input type="text" id="search-input" placeholder="Enter regex (e.g., error|warn)" 
                    style="width: 250px; padding: 5px; border: 1px solid #aaa;">
+            <button id="search-next-btn">⬇️</button>
+            <button id="search-prev-btn">⬆️</button>
 
-
-			<button id="pause-btn" onclick="scroller.pause()">Pause</button>
-            <button id="resume-btn" onclick="scroller.continue()">Resume</button>
+			<button id="pause-btn" onclick="pauseScroller()">Pause</button>
+            <button id="resume-btn" style="display:none" onclick="resumeScroller()">Resume</button>
             
-			<button id="openRegexTableBtn" style="margin-left: 10px; padding: 5px 15px;">Highlight Patterns...</button>
-            <button id="search-next-btn" style="margin-left: 10px; padding: 5px 15px;">Next ⬇️</button>
-            <button id="search-prev-btn" style="padding: 5px 15px;">Prev ⬆️</button>
+			<button id="openRegexTableBtn">Highlight Patterns...</button>
+			<button id="openRegexHideTableBtn">Hide Lines...</button>
+			
         </div>
             
     </div>
@@ -47,6 +48,12 @@
 
     <script>
         // --- CONFIGURATION ---
+        const TABLE_REGEX_COLOR_ID = "regex_color_table_body";
+        const STORAGE_COLOR_KEY_TABLE = "regex_color_rules";
+
+        const TABLE_REGEX_HIDE_ID = "regex_hide_table_body";
+        const STORAGE_HIDE_KEY_TABLE = "regex_hide_rules";
+
         const ESTIMATED_ITEM_HEIGHT = 60;
         const OVERSCAN_COUNT = 10;
 
@@ -383,9 +390,27 @@
                 }
             }
 
+			dont_display_line(html_str) {
+				if (this.arHideRegexLines && this.arHideRegexLines.length > 0) {
+					for (const regexObj of this.arHideRegexLines) {
+						if (regexObj.regex) {
+							const hideRegex = new RegExp(regexObj.regex);
+							if (hideRegex.test(html_str)) {
+								return true; // Line matches a hide regex
+							}
+						}
+					}
+				}
+				return false; // No hide regex matched
+			}
 
 			// Inside VirtualScroller class...
 			add_html(html_str) {
+				if (this.dont_display_line(html_str)) {
+					console.log("Hiding line due to regex match:", html_str);
+					return; // Skip adding this line
+				}
+
 			    this.items.push(html_str);
 
 			    // --- START: Reused Measurement Logic (as in original code) ---
@@ -470,40 +495,16 @@
                 this.spacer.style.height = `${this.totalHeight}px`;
             }
 
+			setHideRegexLines(arRegexLines) {
+				this.arHideRegexLines = arRegexLines;
+			}
 
 			setRegexColors(arRegexColors) {
 				this.arRegexColors = arRegexColors;
 				this.renderVisibleItems();
 			}
 
-			/**
-		     * Private helper to slice the item array, apply regex highlighting, and join the result.
-		     * @param {number} startIndex - The starting index of the slice.
-		     * @param {number} endIndex - The ending index of the slice (exclusive).
-		     * @returns {string} The HTML string ready for innerHTML insertion.
-		     */
-		    _getHighlightedHtml2(startIndex, endIndex) {
-		        if (!this.searchRegex) {
-		            // Fast path: No search is active, return raw HTML string.
-		            return this.items.slice(startIndex, endIndex).join('');
-		        }
-
-		        // Search is active: Map over the array to apply highlighting.
-		        return this.items.slice(startIndex, endIndex).map((itemHtml, index) => {
-		            const itemIndex = startIndex + index; // The absolute index in this.items
-		            
-		            // Distinguish the currently found item (scrolled to) from other matches.
-		            const highlightClass = (itemIndex === this.lastFoundIndex) ? 'search-found' : 'search-highlight';
-		            
-		            // Apply the highlight using String.prototype.replace.
-		            // Note: The 'g' flag on this.searchRegex ensures all matches in the item are replaced.
-		            return itemHtml.replace(this.searchRegex, (match) => {
-		                return `<mark class="${highlightClass}">${match}</mark>`;
-		            });
-		        }).join('');
-		    }
-
-			_getHighlightedHtml(startIndex, endIndex) {
+			_getHighlightedHtml_faster_approximate(startIndex, endIndex) {
 				const itemsToProcess = this.items.slice(startIndex, endIndex);
 
 				// 1. Process for multiple color-coded regexes (this.arRegexColors).
@@ -554,7 +555,9 @@
 				}).join('');
 			}
 
-
+			_getHighlightedHtml(startIndex, endIndex) {
+				return this._getHighlightedHtml_faster_approximate(startIndex, endIndex);
+			}
 
 			/**
 		     * Performs DOM element checks to ensure the rendered block is correctly intersecting the viewport.
@@ -963,13 +966,23 @@
         });
 
 		function updateRegexColorsFromStorage() {
-			const savedData = LStorage.load(STORAGE_KEY_TABLE);
-			if (savedData && savedData[TABLE_ID]) {
-				let colors = savedData[TABLE_ID];
+			const savedData = LStorage.load(STORAGE_COLOR_KEY_TABLE);
+			if (savedData && savedData[TABLE_REGEX_COLOR_ID]) {
+				let colors = savedData[TABLE_REGEX_COLOR_ID];
 				console.log(colors)
 				scroller.setRegexColors(colors);
 			}
 		}
+
+		function updateHideRegexFromStorage() {
+			const savedData = LStorage.load(STORAGE_HIDE_KEY_TABLE);
+			if (savedData && savedData[TABLE_REGEX_HIDE_ID]) {
+				let hideregex = savedData[TABLE_REGEX_HIDE_ID];
+				console.log(hideregex)
+				scroller.setHideRegexLines(hideregex);
+			}
+		}
+
 
         // helper to add many items for demo with random heights, colors, and text
         function addItems(n) {
@@ -1060,7 +1073,7 @@
 					updateRegexColorsFromStorage();
 					
                     //document.getElementById('result_output').textContent = 
-                    //    `Collected Table Data (${savedData && savedData[TABLE_ID] ? savedData[TABLE_ID].length : 0} rules):\n${JSON.stringify(savedData, null, 2)}`;
+                    //    `Collected Table Data (${savedData && savedData[TABLE_REGEX_COLOR_ID] ? savedData[TABLE_REGEX_COLOR_ID].length : 0} rules):\n${JSON.stringify(savedData, null, 2)}`;
                 }
                 
                 const html_string = `
@@ -1070,7 +1083,7 @@
                             <thead>
                                 <tr><th>Regex Pattern</th><th>Highlight Color</th><th>Preview</th><th>Action</th></tr>
                             </thead>
-                            <tbody id="${TABLE_ID}"></tbody>
+                            <tbody id="${TABLE_REGEX_COLOR_ID}"></tbody>
                         </table>
                     </div>
                     <button id="add_row_btn" class="add-row-btn">Add New Rule</button>
@@ -1078,11 +1091,11 @@
 
                 const init_values = {
                     "content": html_string,
-                    "collect_ids": [TABLE_ID], 
+                    "collect_ids": [TABLE_REGEX_COLOR_ID], 
                     "on_close": table_closed_function,
-                    "storage_key": STORAGE_KEY_TABLE,
+                    "storage_key": STORAGE_COLOR_KEY_TABLE,
                     "handlers": {
-                        [TABLE_ID]: {
+                        [TABLE_REGEX_COLOR_ID]: {
                             render: renderTable,
                             load: loadTableData,
                             save: saveTableData
@@ -1094,7 +1107,53 @@
             });
 
 
+            // --- Regex Color Table Modal Handlers (Complex UI) ---
+            document.getElementById('openRegexHideTableBtn').addEventListener('click', () => {
+                // INJECT COMPONENT STYLES HERE, BEFORE MODAL INSTANTIATION
+                _injectTableStyles(); 
+
+                function table_closed_function(elements) {
+
+					updateHideRegexFromStorage();
+					
+                    //document.getElementById('result_output').textContent = 
+                    //    `Collected Table Data (${savedData && savedData[TABLE_REGEX_COLOR_ID] ? savedData[TABLE_REGEX_COLOR_ID].length : 0} rules):\n${JSON.stringify(savedData, null, 2)}`;
+                }
+                
+                const html_string = `
+                    <h3>Regex Hide Lines</h3>
+                    <div class="table-container">
+                        <table class="regex-table">
+                            <thead>
+                                <tr><th>Regex Pattern</th><th>Action</th></tr>
+                            </thead>
+                            <tbody id="${TABLE_REGEX_HIDE_ID}"></tbody>
+                        </table>
+                    </div>
+                    <button id="add_regex_hide_row_btn" class="add-row-btn">Add New Rule</button>
+                `;
+
+                const init_values = {
+                    "content": html_string,
+                    "collect_ids": [TABLE_REGEX_HIDE_ID], 
+                    "on_close": table_closed_function,
+                    "storage_key": STORAGE_HIDE_KEY_TABLE,
+                    "handlers": {
+                        [TABLE_REGEX_HIDE_ID]: {
+                            render: renderRegexHideTable,
+                            load: loadRegexHideTableData,
+                            save: saveRegexHideTableData
+                        }
+                    }
+                };
+
+                new Modal(init_values).show();
+            });
+
+			// Retrieve saved regex color rules from localStorage on init
 			updateRegexColorsFromStorage();
+			// Retrieve saved hide regex rules from localStorage on init 
+			updateHideRegexFromStorage();
 			
 			// --- SSE Integration: receive log lines from /stream and append ---
 			try {
@@ -1154,9 +1213,6 @@
                 }
             }
         }
-
-        const TABLE_ID = "regex_table_body";
-        const STORAGE_KEY_TABLE = "regex_color_rules";
 
         /**
          * 2. Modal Class (FIXED: Table styles removed from here) ✨
@@ -1403,6 +1459,31 @@
             document.head.appendChild(style);
         }
 
+
+        // --- Table Handlers (Unchanged Logic, now properly separated) ---
+        function createRegexHideTableRow(regex = '') {
+            const tr = document.createElement('tr');
+            
+            const tdRegex = document.createElement('td');
+            const regexInput = document.createElement('input');
+            regexInput.type = 'text';
+            regexInput.className = 'regex-hide-input';
+            regexInput.value = regex;
+            tdRegex.appendChild(regexInput);
+            tr.appendChild(tdRegex);
+
+            const tdDelete = document.createElement('td');
+            const deleteButton = document.createElement('button');
+            deleteButton.className = 'delete-btn';
+            deleteButton.textContent = '✖';
+            deleteButton.addEventListener('click', () => tr.remove());
+            tdDelete.appendChild(deleteButton);
+            tr.appendChild(tdDelete);
+
+            return tr;
+        }
+
+
         // --- Table Handlers (Unchanged Logic, now properly separated) ---
         function createTableRow(regex = '', color = 'rgb(255, 255, 255)') {
             const tr = document.createElement('tr');
@@ -1445,6 +1526,17 @@
             return tr;
         }
 
+        function renderRegexHideTable(containerElement, initialValues) {
+             const addRowButton = containerElement.closest('.modal-content').querySelector('#add_regex_hide_row_btn');
+             if (addRowButton) {
+                addRowButton.addEventListener('click', () => {
+                    containerElement.appendChild(createRegexHideTableRow());
+                    containerElement.parentNode.scrollTop = containerElement.parentNode.scrollHeight;
+                });
+             }
+        }
+
+
         function renderTable(containerElement, initialValues) {
              const addRowButton = containerElement.closest('.modal-content').querySelector('#add_row_btn');
              if (addRowButton) {
@@ -1458,8 +1550,8 @@
         function loadTableData(containerElement, allStoredData) {
             containerElement.innerHTML = ''; 
             
-            const storedRules = allStoredData && Array.isArray(allStoredData[TABLE_ID]) 
-                ? allStoredData[TABLE_ID] 
+            const storedRules = allStoredData && Array.isArray(allStoredData[TABLE_REGEX_COLOR_ID]) 
+                ? allStoredData[TABLE_REGEX_COLOR_ID] 
                 : [
                     { regex: 'default', color: 'rgb(150, 150, 255)' }
                 ];
@@ -1468,6 +1560,22 @@
                 containerElement.appendChild(createTableRow(rule.regex, rule.color));
             });
         }
+
+        function loadRegexHideTableData(containerElement, allStoredData) {
+            containerElement.innerHTML = ''; 
+            
+            const storedRules = allStoredData && Array.isArray(allStoredData[TABLE_REGEX_HIDE_ID]) 
+                ? allStoredData[TABLE_REGEX_HIDE_ID] 
+                : [
+                    { regex: 'default' }
+                ];
+
+            storedRules.forEach(rule => {
+                containerElement.appendChild(createRegexHideTableRow(rule.regex, rule.color));
+            });
+        }
+
+
 
         function saveTableData(containerElement) {
             const data = [];
@@ -1488,8 +1596,33 @@
         }
 
 
+        function saveRegexHideTableData(containerElement) {
+            const data = [];
+            const rows = containerElement.querySelectorAll('tr');
+            rows.forEach(row => {
+                const regexInput = row.querySelector('.regex-hide-input');
+                
+                if (regexInput && regexInput.value.trim() !== '') {
+                    data.push({
+                        regex: regexInput.value,
+                    });
+                }
+            });
+            
+            return { [containerElement.id]: data };
+        }
 
+		function pauseScroller() {
+			scroller.pause();
+			document.getElementById('pause-btn').style.display = 'none';
+			document.getElementById('resume-btn').style.display = 'inline-block';
+		}
 
+		function resumeScroller() {
+			scroller.continue();
+			document.getElementById('resume-btn').style.display = 'none';
+			document.getElementById('pause-btn').style.display = 'inline-block';
+		}
 
     </script>
 </body>

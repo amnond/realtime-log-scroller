@@ -369,6 +369,10 @@ The JavaScript logic only intervenes to **re-render and reposition** the content
 ### Implementation Notes
 * Earlier versions used transform for positioning and included will-change: transform. Since layout positioning (top) is now used to preserve correct text selection, the will-change hint is intentionally omitted to avoid unnecessary compositing.
 
+### TODO
+* Text highlighting uses simple string replacement which can wreck havoc on HTML rendering
+* Regex not precompiled and can be optimized - perhaps simple string search is good enough in most cases
+* Refactor code, divide into more modules etc. 
 
 ## License
 
