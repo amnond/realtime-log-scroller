@@ -1,15 +1,15 @@
 
-# 🚀 Virtual Scroller: High-Performance Log Viewing of arbitrary height HTML items
+# 🚀 Virtual Scroller: High-Performance Log Viewing
 
-A high-performance virtual scroller for rendering large and real-time log streams in the browser, with correct text selection, search, keyboard navigation, and dynamic item heights.
+A high-performance virtual scroller for rendering large and real-time log streams in the browser, with correct text selection, search, regex color highlighting,  keyboard navigation, and dynamic item heights.
 This component implements **Virtual Scrolling** to efficiently handle extremely large lists of arbitrary HTML content with minimal performance impact. By rendering only the items visible within the viewport, it maintains a small DOM footprint, ensuring fast scrolling and painting, even as data streams in.
 
-## A note to AI naysayers
+## A Note to Generative AI Naysayers
 This project was built iteratively with assistance from **Claude Code**, **Google Gemini** and **ChatGPT**.
 
-It took about 2 days to complete as opposed to a month at least if I has to estimate the time it would take me to implement entirely on my own.
+It took about 2 days to complete from nothing to this, as opposed to a month at least if I were to estimate the time it would take me to implement it entirely on my own.
 
-The README itself was authored with ChatGPT’s help, with the explicit goal of making the core ideas easily understandable.
+The README itself was authored with ChatGPT’s help, with the goal of making the core ideas easily understandable, but it turned out a bit too verbose...
 
 ---
 
@@ -285,7 +285,7 @@ The fundamental challenge is convincing the browser that there is a long documen
 
 | Element | Role | Key Property | Purpose |
 | :--- | :--- | :--- | :--- |
-| **`#virtual-viewport`** | The **Frame** | `overflow-y: scroll`, Fixed `height` | Defines the visible scroll area; clips children. |
+| **`#virtual-viewport`** | The **Frame** | `overflow-y: scroll`, Fixed `height` | Defines the visible scroll area; clips children. Contains #spacer-element and #content-window|
 | **`#spacer-element`** | The **Scrollbar Engine** | Massive `height` (equal to total items' cumulative height) | Creates the native scrollbar and dictates the full scroll range for `scrollTop`. |
 | **`#content-window`** | The **Rendered Block** | `position: absolute` | Holds only the *currently visible* items. It is moved vertically to align with the scroll position. |
 
@@ -372,4 +372,4 @@ The JavaScript logic only intervenes to **re-render and reposition** the content
 
 ## License
 
-MIT (or your preferred license)
+MIT

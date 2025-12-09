@@ -12,7 +12,7 @@
              non-invasive. */
     </style>
 </head>
-<body>
+<body onLoad="init()">
 
     <div>
         <h2 style="text-align: center;">O(1) Smart Scaling Virtual Scroller Demo</h2>
@@ -30,6 +30,7 @@
 			<button id="pause-btn" onclick="scroller.pause()">Pause</button>
             <button id="resume-btn" onclick="scroller.continue()">Resume</button>
             
+			<button id="openRegexTableBtn" style="margin-left: 10px; padding: 5px 15px;">Highlight Patterns...</button>
             <button id="search-next-btn" style="margin-left: 10px; padding: 5px 15px;">Next ⬇️</button>
             <button id="search-prev-btn" style="padding: 5px 15px;">Prev ⬆️</button>
         </div>
@@ -469,13 +470,19 @@
                 this.spacer.style.height = `${this.totalHeight}px`;
             }
 
+
+			setRegexColors(arRegexColors) {
+				this.arRegexColors = arRegexColors;
+				this.renderVisibleItems();
+			}
+
 			/**
 		     * Private helper to slice the item array, apply regex highlighting, and join the result.
 		     * @param {number} startIndex - The starting index of the slice.
 		     * @param {number} endIndex - The ending index of the slice (exclusive).
 		     * @returns {string} The HTML string ready for innerHTML insertion.
 		     */
-		    _getHighlightedHtml(startIndex, endIndex) {
+		    _getHighlightedHtml2(startIndex, endIndex) {
 		        if (!this.searchRegex) {
 		            // Fast path: No search is active, return raw HTML string.
 		            return this.items.slice(startIndex, endIndex).join('');
@@ -494,7 +501,59 @@
 		                return `<mark class="${highlightClass}">${match}</mark>`;
 		            });
 		        }).join('');
-		    }            
+		    }
+
+			_getHighlightedHtml(startIndex, endIndex) {
+				const itemsToProcess = this.items.slice(startIndex, endIndex);
+
+				// 1. Process for multiple color-coded regexes (this.arRegexColors).
+				// This is done BEFORE the primary search regex so that both can be applied
+				// (though the inner highlight will be nested).
+				const colorHighlightedItems = itemsToProcess.map((itemHtml) => {
+					let processedHtml = itemHtml;
+
+					// Apply highlighting for each regex in arRegexColors
+					if (this.arRegexColors && this.arRegexColors.length > 0) {
+						for (const regexObj of this.arRegexColors) {
+							// Ensure regex is a string before creating a RegExp object
+							if (regexObj.regex) {
+								// Create a RegExp object with the 'g' flag for global replacement
+								// The 'i' flag (case-insensitivity) may be needed depending on your requirement.
+								const colorRegex = new RegExp(regexObj.regex, 'g'); 
+								const colorStyle = `background-color: ${regexObj.color}; padding: 0;`;
+
+								// Replace all matches with a <mark> tag using the specified color
+								processedHtml = processedHtml.replace(colorRegex, (match) => {
+									return `<mark style="${colorStyle}">${match}</mark>`;
+								});
+							}
+						}
+					}
+					return processedHtml;
+				});
+
+				// 2. Handle the primary search highlight (this.searchRegex).
+				if (!this.searchRegex) {
+					// Fast path: No primary search, return the color-highlighted HTML string.
+					return colorHighlightedItems.join('');
+				}
+
+				// Primary Search is active: Map over the color-highlighted array to apply the primary highlight.
+				return colorHighlightedItems.map((itemHtml, index) => {
+					const itemIndex = startIndex + index; // The absolute index in this.items
+
+					// Distinguish the currently found item (scrolled to) from other matches.
+					const highlightClass = (itemIndex === this.lastFoundIndex) ? 'search-found' : 'search-highlight';
+
+					// Apply the highlight using String.prototype.replace.
+					// Note: The 'g' flag on this.searchRegex ensures all matches in the item are replaced.
+					// The primary search will now wrap any existing color highlights if the pattern includes them.
+					return itemHtml.replace(this.searchRegex, (match) => {
+						return `<mark class="${highlightClass}">${match}</mark>`;
+					});
+				}).join('');
+			}
+
 
 
 			/**
@@ -896,11 +955,21 @@
             }
         }
 
+		//-------------------------------------------------------------------------------------------
         // Instantiate the scroller with only the viewport ID; all child elements are auto-discovered
         const scroller = new VirtualScroller('virtual-viewport', {
             estimatedHeight: ESTIMATED_ITEM_HEIGHT,
             overscan: OVERSCAN_COUNT
         });
+
+		function updateRegexColorsFromStorage() {
+			const savedData = LStorage.load(STORAGE_KEY_TABLE);
+			if (savedData && savedData[TABLE_ID]) {
+				let colors = savedData[TABLE_ID];
+				console.log(colors)
+				scroller.setRegexColors(colors);
+			}
+		}
 
         // helper to add many items for demo with random heights, colors, and text
         function addItems(n) {
@@ -936,9 +1005,10 @@
         // Initialize with some items
         addItems(30);
 
+		function init()
+		{
+			// --- Search Functionality Event Listeners ---
 
-		// --- Search Functionality Event Listeners ---
-		(function() {
 		    const searchInput = document.getElementById('search-input');
 		    const nextButton = document.getElementById('search-next-btn');
 		    const prevButton = document.getElementById('search-prev-btn');
@@ -979,25 +1049,447 @@
 		            }
 		        }
 		    });
-		})();
+
+            // --- Regex Color Table Modal Handlers (Complex UI) ---
+            document.getElementById('openRegexTableBtn').addEventListener('click', () => {
+                // INJECT COMPONENT STYLES HERE, BEFORE MODAL INSTANTIATION
+                _injectTableStyles(); 
+
+                function table_closed_function(elements) {
+
+					updateRegexColorsFromStorage();
+					
+                    //document.getElementById('result_output').textContent = 
+                    //    `Collected Table Data (${savedData && savedData[TABLE_ID] ? savedData[TABLE_ID].length : 0} rules):\n${JSON.stringify(savedData, null, 2)}`;
+                }
+                
+                const html_string = `
+                    <h3>Regex Highlight</h3>
+                    <div class="table-container">
+                        <table class="regex-table">
+                            <thead>
+                                <tr><th>Regex Pattern</th><th>Highlight Color</th><th>Preview</th><th>Action</th></tr>
+                            </thead>
+                            <tbody id="${TABLE_ID}"></tbody>
+                        </table>
+                    </div>
+                    <button id="add_row_btn" class="add-row-btn">Add New Rule</button>
+                `;
+
+                const init_values = {
+                    "content": html_string,
+                    "collect_ids": [TABLE_ID], 
+                    "on_close": table_closed_function,
+                    "storage_key": STORAGE_KEY_TABLE,
+                    "handlers": {
+                        [TABLE_ID]: {
+                            render: renderTable,
+                            load: loadTableData,
+                            save: saveTableData
+                        }
+                    }
+                };
+
+                new Modal(init_values).show();
+            });
 
 
-        // --- SSE Integration: receive log lines from /stream and append ---
-        try {
-            const logSSE = new EventSource('/stream');
+			updateRegexColorsFromStorage();
+			
+			// --- SSE Integration: receive log lines from /stream and append ---
+			try {
+				const logSSE = new EventSource('/stream');
 
-            logSSE.onmessage = function(event) {
-                const text = event.data;
-                const html = `<div class="scroller-item">${text}</div>`;
-                scroller.add_html(html);
-            };
+				logSSE.onmessage = function(event) {
+					const text = event.data;
+					const html = `<div class="scroller-item">${text}</div>`;
+					scroller.add_html(html);
+				};
 
-            logSSE.onerror = function(err) {
-                console.error('EventSource error:', err);
-            };
-        } catch (e) {
-            console.warn('SSE not supported or failed to initialize', e);
+				logSSE.onerror = function(err) {
+					console.error('EventSource error:', err);
+				};
+			} catch (e) {
+				console.warn('SSE not supported or failed to initialize', e);
+			}
+		} // end of init()
+
+
+        // --- Shared Helpers (Used by Modal and User Handlers) ---
+        function setElementValue(element, value) {
+            if (['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName)) {
+                element.value = value;
+            } else {
+                element.textContent = value;
+            }
         }
+        
+        function getElementValue(element) {
+            if (['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName)) {
+                return element.value;
+            } else {
+                return element.textContent;
+            }
+        }
+
+        /**
+         * 1. LStorage Class 📦 (Unchanged)
+         */
+        class LStorage {
+            static save(key, data) {
+                try {
+                    localStorage.setItem(key, JSON.stringify(data));
+                } catch (e) {
+                    console.error("LStorage: Failed to save data.", e);
+                }
+            }
+
+            static load(key) {
+                try {
+                    const serializedData = localStorage.getItem(key);
+                    return serializedData === null ? null : JSON.parse(serializedData);
+                } catch (e) {
+                    console.error("LStorage: Failed to load data.", e);
+                    return null;
+                }
+            }
+        }
+
+        const TABLE_ID = "regex_table_body";
+        const STORAGE_KEY_TABLE = "regex_color_rules";
+
+        /**
+         * 2. Modal Class (FIXED: Table styles removed from here) ✨
+         */
+        class Modal {
+            constructor(options) {
+                this.options = {
+                    content: "",
+                    ok_button: true,
+                    cancel_button: true,
+                    on_close: (elements) => {}, 
+                    collect_ids: [],
+                    storage_key: null,
+                    handlers: {}, 
+                    ...options
+                };
+
+                this.modalElement = null;
+                this.overlayElement = null;
+
+                this._injectStyles(); // Only injects generic modal styles
+                
+                this.initialValues = this.options.storage_key 
+                    ? LStorage.load(this.options.storage_key) 
+                    : null;
+
+                this._createElements();
+                this._attachContentAndButtons();
+                this._applyInitialValues();
+            }
+
+            // FIXED: Only contains generic modal structure and simple form styles
+            _injectStyles() {
+                const styleId = 'modal-component-styles';
+                if (document.getElementById(styleId)) {
+                    return; 
+                }
+
+                const style = document.createElement('style');
+                style.id = styleId;
+                style.innerHTML = `
+                    /* --- Modal Overlay and Box (MODAL'S CONCERN) --- */
+                    .modal-overlay {
+                        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                        background-color: rgba(0, 0, 0, 0.7); display: flex; 
+                        justify-content: center; align-items: center; z-index: 1000; 
+                        visibility: hidden; opacity: 0; transition: opacity 0.3s;
+                    }
+                    .modal-overlay.visible { visibility: visible; opacity: 1; }
+                    .modal-box { 
+                        background: #fff; padding: 30px; border-radius: 8px; 
+                        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3); max-width: 550px; 
+                        width: 90%; transform: scale(0.95); transition: transform 0.3s;
+						font-family: Arial, sans-serif;
+                    }
+                    .modal-overlay.visible .modal-box { transform: scale(1); }
+
+                    /* --- Content and Form Elements (MODAL'S CONCERN - simple inputs) --- */
+                    .modal-content h3 { margin-top: 0; color: #007bff; }
+                    .modal-content label { display: block; margin-bottom: 5px; font-weight: bold; }
+                    .modal-content input[type="text"], .modal-content span {
+                        display: block; padding: 2px; 
+                        border: 1px solid #ddd; border-radius: 4px; width: calc(100% - 16px);
+                        box-sizing: border-box; /* Crucial for width calculations */
+                    }
+
+                    /* --- Footer and Buttons (MODAL'S CONCERN) --- */
+                    .modal-footer { 
+                        margin-top: 20px; text-align: right; border-top: 1px solid #eee; 
+                        padding-top: 15px; 
+                    }
+                    .modal-footer button {
+                        padding: 10px 20px; margin-left: 10px; border: none; 
+                        border-radius: 4px; cursor: pointer; font-weight: bold; color: white;
+                    }
+                    .modal-footer .modal-ok { background-color: #28a745; }
+                    .modal-footer .modal-cancel { background-color: #6c757d; }
+                `;
+                document.head.appendChild(style);
+            }
+
+            _createElements() {
+                this.overlayElement = document.createElement('div');
+                this.overlayElement.className = 'modal-overlay';
+                this.overlayElement.addEventListener('click', (e) => {
+                    if (e.target === this.overlayElement) {
+                        this._handleClose(false);
+                    }
+                });
+
+                this.modalElement = document.createElement('div');
+                this.modalElement.className = 'modal-box';
+                this.contentElement = document.createElement('div');
+                this.contentElement.className = 'modal-content';
+                this.footerElement = document.createElement('div');
+                this.footerElement.className = 'modal-footer';
+
+                this.modalElement.appendChild(this.contentElement);
+                this.modalElement.appendChild(this.footerElement);
+                this.overlayElement.appendChild(this.modalElement);
+                document.body.appendChild(this.overlayElement);
+            }
+
+            _attachContentAndButtons() {
+                this.contentElement.innerHTML = this.options.content;
+                this._runCustomRender(); 
+
+                if (this.options.ok_button) {
+                    const okButton = document.createElement('button');
+                    okButton.className = 'modal-ok';
+                    okButton.textContent = 'OK';
+                    okButton.addEventListener('click', () => this._handleClose(true));
+                    this.footerElement.appendChild(okButton);
+                }
+
+                if (this.options.cancel_button) {
+                    const cancelButton = document.createElement('button');
+                    cancelButton.className = 'modal-cancel';
+                    cancelButton.textContent = 'Cancel';
+                    cancelButton.addEventListener('click', () => this._handleClose(false));
+                    this.footerElement.appendChild(cancelButton);
+                }
+            }
+            
+            _runCustomRender() {
+                for (const id in this.options.handlers) {
+                    const handler = this.options.handlers[id];
+                    if (handler.render && typeof handler.render === 'function') {
+                        const element = this.contentElement.querySelector(`#${id}`);
+                        if (element) {
+                            handler.render(element, this.initialValues);
+                        }
+                    }
+                }
+            }
+
+            _applyInitialValues() {
+                if (!this.initialValues) return;
+
+                for (const id of this.options.collect_ids) {
+                    const element = this.contentElement.querySelector(`#${id}`);
+                    if (!element) continue;
+
+                    const handler = this.options.handlers[id];
+
+                    if (handler && handler.load && typeof handler.load === 'function') {
+                        handler.load(element, this.initialValues);
+                    } else if (this.initialValues[id] !== undefined) {
+                        setElementValue(element, this.initialValues[id]);
+                    }
+                }
+            }
+
+            _collectElements() {
+                const elements = {};
+                this.options.collect_ids.forEach(id => {
+                    const element = this.contentElement.querySelector(`#${id}`);
+                    if (element) {
+                        elements[id] = element;
+                    }
+                });
+                return elements;
+            }
+            
+            _handleClose(isOk) {
+                this.overlayElement.classList.remove('visible');
+
+                if (isOk) {
+                    const collectedElements = this._collectElements();
+                    const finalData = {};
+                    let shouldSave = !!this.options.storage_key;
+
+                    if (shouldSave) {
+                        for (const id in collectedElements) {
+                            const element = collectedElements[id];
+                            const handler = this.options.handlers[id];
+
+                            if (handler && handler.save && typeof handler.save === 'function') {
+                                Object.assign(finalData, handler.save(element));
+                            } else {
+                                finalData[id] = getElementValue(element);
+                            }
+                        }
+                        
+                        LStorage.save(this.options.storage_key, finalData);
+                    }
+                    
+                    if (typeof this.options.on_close === 'function') {
+                        this.options.on_close(collectedElements);
+                    }
+                }
+
+                this.overlayElement.addEventListener('transitionend', () => {
+                    if (!this.overlayElement.classList.contains('visible')) {
+                        this._destroy();
+                    }
+                }, { once: true });
+            }
+
+            _destroy() {
+                if (this.overlayElement && this.overlayElement.parentNode) {
+                    this.overlayElement.parentNode.removeChild(this.overlayElement);
+                }
+            }
+
+            show() {
+                this.overlayElement.offsetWidth;
+                this.overlayElement.classList.add('visible');
+            }
+        } // End of Modal Class
+
+        function _injectTableStyles() {
+            const styleId = 'regex-table-component-styles';
+            if (document.getElementById(styleId)) {
+                return; 
+            }
+
+            const style = document.createElement('style');
+            style.id = styleId;
+            style.innerHTML = `
+                /* --- Table-specific styles (COMPONENT'S CONCERN) --- */
+                .table-container { 
+                    max-height: 250px; overflow-y: auto; margin-bottom: 15px; 
+                    border: 1px solid #ddd; border-radius: 4px;
+                }
+                .regex-table { width: 100%; border-collapse: collapse; }
+                .regex-table th, 
+                .regex-table td { padding: 2px border-bottom: 1px solid #eee; text-align: left; vertical-align: middle; }
+                .regex-table th { background-color: #f8f9fa; position: sticky; top: 0; z-index: 1; }
+                .regex-table input[type="text"] { 
+                    width: 95%; padding: 3px; border: 1px solid #ccc; 
+                    height: 24px; box-sizing: border-box;
+                }
+                .regex-table .color-preview { 
+                    display: inline-block; width: 20px; height: 20px; 
+                    border: 1px solid #333; vertical-align: middle; margin-left: 5px; 
+                }
+                .regex-table .delete-btn { background: none; border: none; color: red; cursor: pointer; font-weight: bold; }
+                .add-row-btn { 
+                    background-color: #17a2b8; color: white; padding: 8px 15px; 
+                    border: none; border-radius: 4px; cursor: pointer; margin-top: 10px; 
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        // --- Table Handlers (Unchanged Logic, now properly separated) ---
+        function createTableRow(regex = '', color = 'rgb(255, 255, 255)') {
+            const tr = document.createElement('tr');
+            
+            const tdRegex = document.createElement('td');
+            const regexInput = document.createElement('input');
+            regexInput.type = 'text';
+            regexInput.className = 'regex-input';
+            regexInput.value = regex;
+            tdRegex.appendChild(regexInput);
+            tr.appendChild(tdRegex);
+
+            const tdColor = document.createElement('td');
+            const colorInput = document.createElement('input');
+            colorInput.type = 'text';
+            colorInput.className = 'color-input';
+            colorInput.value = color;
+            tdColor.appendChild(colorInput);
+            tr.appendChild(tdColor);
+
+            const tdPreview = document.createElement('td');
+            const colorPreview = document.createElement('span');
+            colorPreview.className = 'color-preview';
+            colorPreview.style.backgroundColor = color;
+            tdPreview.appendChild(colorPreview);
+            tr.appendChild(tdPreview);
+
+            const tdDelete = document.createElement('td');
+            const deleteButton = document.createElement('button');
+            deleteButton.className = 'delete-btn';
+            deleteButton.textContent = '✖';
+            deleteButton.addEventListener('click', () => tr.remove());
+            tdDelete.appendChild(deleteButton);
+            tr.appendChild(tdDelete);
+
+            colorInput.addEventListener('input', () => {
+                colorPreview.style.backgroundColor = colorInput.value;
+            });
+
+            return tr;
+        }
+
+        function renderTable(containerElement, initialValues) {
+             const addRowButton = containerElement.closest('.modal-content').querySelector('#add_row_btn');
+             if (addRowButton) {
+                addRowButton.addEventListener('click', () => {
+                    containerElement.appendChild(createTableRow());
+                    containerElement.parentNode.scrollTop = containerElement.parentNode.scrollHeight;
+                });
+             }
+        }
+
+        function loadTableData(containerElement, allStoredData) {
+            containerElement.innerHTML = ''; 
+            
+            const storedRules = allStoredData && Array.isArray(allStoredData[TABLE_ID]) 
+                ? allStoredData[TABLE_ID] 
+                : [
+                    { regex: 'default', color: 'rgb(150, 150, 255)' }
+                ];
+
+            storedRules.forEach(rule => {
+                containerElement.appendChild(createTableRow(rule.regex, rule.color));
+            });
+        }
+
+        function saveTableData(containerElement) {
+            const data = [];
+            const rows = containerElement.querySelectorAll('tr');
+            rows.forEach(row => {
+                const regexInput = row.querySelector('.regex-input');
+                const colorInput = row.querySelector('.color-input');
+                
+                if (regexInput && colorInput && regexInput.value.trim() !== '') {
+                    data.push({
+                        regex: regexInput.value,
+                        color: colorInput.value
+                    });
+                }
+            });
+            
+            return { [containerElement.id]: data };
+        }
+
+
+
+
 
     </script>
 </body>
