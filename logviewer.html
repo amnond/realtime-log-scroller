@@ -12,13 +12,14 @@
              non-invasive. */
     </style>
 </head>
-<body onLoad="init()">
+<body onLoad="init()" style="font-family: Arial, Helvetica, sans-serif;" >
 
     <div>
         <h2 style="text-align: center;">O(1) Smart Scaling Virtual Scroller Demo</h2>
         <div style="text-align: center; margin-bottom: 10px;">
             <button onclick="addItems(520)">Add 520 Random Log Lines</button>
             <button onclick="scroller.clear()">Clear All</button>
+			<span id="stats-display" style="margin-left: 20px;"></span>
         </div>
 
 		<div style="text-align: center; margin-bottom: 10px; padding: 5px; border: 1px solid #ccc; background-color: #f7f7f7;">
@@ -69,6 +70,8 @@
                 }
 
                 // Auto-discover required child elements by class or ID
+				this.totalItemsReceived = 0;
+				this.totalItemsDisplayed = 0;
                 this.viewport = viewportElement;
                 this.spacer = viewportElement.querySelector('.vs-spacer, #spacer-element');
                 this.contentWindow = viewportElement.querySelector('.vs-content-window, #content-window');
@@ -405,12 +408,20 @@
 			}
 
 			// Inside VirtualScroller class...
+			getStats() {
+				return {
+					totalItemsReceived: this.totalItemsReceived,
+					totalItemsDisplayed: this.totalItemsDisplayed
+				}
+			}
+
 			add_html(html_str) {
+				this.totalItemsReceived++
 				if (this.dont_display_line(html_str)) {
 					console.log("Hiding line due to regex match:", html_str);
 					return; // Skip adding this line
 				}
-
+				this.totalItemsDisplayed++
 			    this.items.push(html_str);
 
 			    // --- START: Reused Measurement Logic (as in original code) ---
@@ -1012,6 +1023,8 @@
                 
                 const html = `<div class="scroller-item" style="height: ${height}px; background-color: ${color}; display: flex; align-items: center; padding: 10px; overflow: hidden; box-sizing: border-box;"><span style="color: white; font-weight: bold; margin-right: 8px;">#${scroller.items.length + 1}</span><span style="color: white; font-size: 14px;">${text}</span></div>`;
                 scroller.add_html(html);
+				let stats = scroller.getStats();
+				displayStats(stats);
             }
         }
 
@@ -1163,6 +1176,8 @@
 					const text = event.data;
 					const html = `<div class="scroller-item">${text}</div>`;
 					scroller.add_html(html);
+					let stats = scroller.getStats();
+					displayStats(stats);
 				};
 
 				logSSE.onerror = function(err) {
@@ -1576,7 +1591,6 @@
         }
 
 
-
         function saveTableData(containerElement) {
             const data = [];
             const rows = containerElement.querySelectorAll('tr');
@@ -1624,6 +1638,10 @@
 			document.getElementById('pause-btn').style.display = 'inline-block';
 		}
 
+		function displayStats(stats) {
+			let statsDisplay = document.getElementById('stats-display');
+			statsDisplay.textContent = `Received: ${stats.totalItemsReceived} Rendered: ${stats.totalItemsDisplayed}`;
+		}
     </script>
 </body>
 </html>
