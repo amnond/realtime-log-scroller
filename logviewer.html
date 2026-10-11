@@ -58,6 +58,33 @@
         const ESTIMATED_ITEM_HEIGHT = 60;
         const OVERSCAN_COUNT = 10;
 
+        // Browsers cap the maximum height of an element / scroll area (about
+        // 33.5M px in Chrome, ~17.9M px in Firefox). When virtual content exceeds
+        // that limit the spacer can no longer represent the whole list, so we cap
+        // the spacer and compress the scrollbar: physical scroll positions are
+        // mapped proportionally onto the logical (full-size) content coordinates.
+        const DEFAULT_MAX_SCROLL_HEIGHT = 10000000;
+
+        // Feature-detect the browser's maximum element height once at startup.
+        // Falls back to DEFAULT_MAX_SCROLL_HEIGHT if detection fails.
+        const BROWSER_MAX_SCROLL_HEIGHT = (() => {
+            try {
+                const probe = document.createElement('div');
+                probe.style.position = 'absolute';
+                probe.style.top = '-100000px';
+                probe.style.left = '0';
+                probe.style.width = '1px';
+                probe.style.height = '1000000000px';
+                document.body.appendChild(probe);
+                const detected = Math.floor(probe.offsetHeight);
+                probe.parentNode.removeChild(probe);
+                if (detected > 0) return detected;
+            } catch (e) {
+                // Ignore and fall back to the constant.
+            }
+            return DEFAULT_MAX_SCROLL_HEIGHT;
+        })();
+
         class VirtualScroller {
             constructor(viewportId, opts = {}) {
                 // Accept only the viewport ID; auto-discover required child elements
@@ -101,6 +128,12 @@
                 // Optional: performance tuning parameters (with sensible defaults)
                 this.estimatedHeight = opts.estimatedHeight || ESTIMATED_ITEM_HEIGHT;
                 this.overscan = typeof opts.overscan === 'number' ? opts.overscan : OVERSCAN_COUNT;
+                // Maximum physical height the spacer may occupy. Defaults to the
+                // detected browser limit; compression only kicks in above this.
+                this.maxScrollHeight = typeof opts.maxScrollHeight === 'number' ? opts.maxScrollHeight : BROWSER_MAX_SCROLL_HEIGHT;
+                // When true, incoming text is HTML-escaped before insertion. When
+                // false (default) it is rendered as HTML.
+                this.escapeHtml = !!opts.escapeHtml;
 
                 this.items = [];
                 this.itemHeights = [];
@@ -117,6 +150,11 @@
                 this.lastStartIndex = 0;
                 this.resizeTimer = null;
                 this.paused = false;
+                // Whether the view is currently pinned to the bottom. Updated as the
+                // user scrolls; combined with `paused` it drives the follow state.
+                this.atBottom = true;
+                this._following = true;
+                this._onFollowChange = typeof opts.onFollowChange === 'function' ? opts.onFollowChange : null;
 
                 // Bindings
                 this._onScroll = this.renderVisibleItems.bind(this);
@@ -313,7 +351,9 @@
 		            }
 		            
 		            // --- PASS 1: Search Backward from the determined start point down to the break point ---
-		            for (let i = searchStart; i >= searchBreakPoint; i--) {
+			            // Clamp the lower bound to 0 so we never read this.items[-1].
+			            const passOneLowerBound = Math.max(0, searchBreakPoint);
+			            for (let i = searchStart; i >= passOneLowerBound; i--) {
 		                if (regex.test(this.items[i])) {
 		                    this._scrollToItem(i);
 		                    return i;
@@ -355,8 +395,9 @@
 		            const buffer = 20; 
 		            const targetScrollTop = itemTopOffset - buffer;
 		            
-		            // Set the scroll position
-		            this.viewport.scrollTop = Math.max(0, targetScrollTop);
+		            // Map the logical content offset onto a physical scroll position
+		            // (identity unless the scrollbar is compressed by the size limit).
+		            this.viewport.scrollTop = Math.max(0, this.logicalToPhysical(targetScrollTop));
 
 		            // Update state and CRITICAL: Force a synchronous re-render.
 		            // This ensures the correct items are loaded into the DOM and the 'search-found' class is applied instantly.
@@ -422,7 +463,17 @@
 					return; // Skip adding this line
 				}
 				this.totalItemsDisplayed++
-			    this.items.push(html_str);
+					    // Capture whether the view was pinned to the bottom BEFORE the new
+					    // item changes totalHeight, so we only auto-follow when already at
+					    // the bottom. Otherwise the user's position (reading older logs)
+					    // is preserved. Compare in logical coordinates so the check stays
+					    // correct when the scrollbar is compressed.
+					    // Follow new lines only when the view is pinned to the bottom and
+					    // not explicitly paused. `atBottom` is kept up to date by
+					    // renderVisibleItems() as the user scrolls.
+					    const shouldFollow = !this.paused && this.atBottom;
+
+					    this.items.push(html_str);
 
 			    // --- START: Reused Measurement Logic (as in original code) ---
 			    let actualHeight;
@@ -449,39 +500,56 @@
 
 			    this.updateSpacerHeight();
 			    
-			    // --- MODIFIED SCROLL LOGIC STARTS HERE ---
-			    if (!this.paused) {
-			        // Calculate the maximum possible scroll position (the bottom of the content)
-			        // using the new total height and the viewport's height.
-			        const maxScroll = Math.max(0, this.totalHeight - this.viewport.clientHeight);
-			        
-			        // Check if the user is already viewing the bottom of the logs, OR if the new
-			        // item pushes the content just past the current scroll position.
-			        // A simple check like: this.viewport.scrollTop >= maxScroll - this.estimatedHeight * 2 
-			        // will preserve user's position when they are looking at older logs.
-			        //
-			        // TO ALWAYS SCROLL TO THE BOTTOM WHEN NEW ITEM IS ADDED:
-			        
-			        // 1. Force a re-render to ensure the new item's block is loaded.
-			        this.renderVisibleItems();
-			        
-			        // 2. Calculate the maximum scroll position *after* the spacer height has been updated.
-			        // We use the spacer height directly as it's the source of truth for the scrollbar.
-			        const maxScrollAfterUpdate = Math.max(0, this.spacer.offsetHeight - this.viewport.clientHeight);
-
-			        // 3. Set scrollTop to the maximum value to ensure the new item is visible.
-			        this.viewport.scrollTop = maxScrollAfterUpdate;
-			    }
-			    // --- MODIFIED SCROLL LOGIC ENDS HERE ---
+					    // Only auto-follow new lines when the user is pinned to the
+					    // bottom; if they scrolled up to read older logs, keep their
+					    // position intact.
+					    if (shouldFollow) {
+					        // Pin to the newest line, then render it.
+					        this.scrollToBottom();
+					        this.renderVisibleItems();
+					    }
 			}            
 			
             pause() {
                 this.paused = true;
+                this._updateFollowingState();
+            }
+
+            // Stream the viewport to the newest line (bottom of the list),
+            // honouring the compressed-scroll mapping when active.
+            scrollToBottom() {
+                const maxPhysical = Math.max(0, this.physicalHeight() - this.viewport.clientHeight);
+                this.viewport.scrollTop = maxPhysical;
             }
 
             continue() {
                 this.paused = false;
+                // Resuming always returns the user to the bottom so they can watch
+                // new lines as they arrive, regardless of where they had scrolled.
+                this.scrollToBottom();
                 this.renderVisibleItems();
+            }
+
+            // True while the scroller is auto-following new lines at the bottom.
+            isFollowing() {
+                return this._following;
+            }
+
+            _updateFollowingState() {
+                this._setFollowing(!this.paused && this.atBottom);
+            }
+
+            _setFollowing(value) {
+                value = !!value;
+                if (value === this._following) return;
+                this._following = value;
+                if (this._onFollowChange) {
+                    try {
+                        this._onFollowChange(value);
+                    } catch (e) {
+                        console.error('VirtualScroller: onFollowChange handler threw', e);
+                    }
+                }
             }
 
             clear() {
@@ -502,8 +570,36 @@
                 return this.cumulativeHeights[index - 1] || 0;
              }
 
+            // Height the spacer is allowed to occupy. Past the browser limit the
+            // spacer stops growing; scroll positions are then compressed instead.
+            physicalHeight() {
+                return Math.min(this.totalHeight, this.maxScrollHeight);
+            }
+
+            // Compression factor mapping logical content pixels to physical spacer
+            // pixels. Returns 1 while the content fits under the browser limit, so
+            // nothing changes unless compression is actually required.
+            scrollFactor() {
+                const physicalMax = Math.max(0, this.physicalHeight() - this.viewport.clientHeight);
+                const logicalMax = Math.max(0, this.totalHeight - this.viewport.clientHeight);
+                if (logicalMax <= 0) return 1;
+                return Math.min(1, physicalMax / logicalMax);
+            }
+
+            // Physical (spacer) scroll offset -> logical (content) offset.
+            physicalToLogical(physicalScrollTop) {
+                const factor = this.scrollFactor();
+                if (factor <= 0) return 0;
+                return physicalScrollTop / factor;
+            }
+
+            // Logical (content) offset -> physical (spacer) scroll offset.
+            logicalToPhysical(logicalScrollTop) {
+                return logicalScrollTop * this.scrollFactor();
+            }
+
             updateSpacerHeight() {
-                this.spacer.style.height = `${this.totalHeight}px`;
+                this.spacer.style.height = `${this.physicalHeight()}px`;
             }
 
 			setHideRegexLines(arRegexLines) {
@@ -515,59 +611,120 @@
 				this.renderVisibleItems();
 			}
 
-			_getHighlightedHtml_faster_approximate(startIndex, endIndex) {
-				const itemsToProcess = this.items.slice(startIndex, endIndex);
-
-				// 1. Process for multiple color-coded regexes (this.arRegexColors).
-				// This is done BEFORE the primary search regex so that both can be applied
-				// (though the inner highlight will be nested).
-				const colorHighlightedItems = itemsToProcess.map((itemHtml) => {
-					let processedHtml = itemHtml;
-
-					// Apply highlighting for each regex in arRegexColors
-					if (this.arRegexColors && this.arRegexColors.length > 0) {
-						for (const regexObj of this.arRegexColors) {
-							// Ensure regex is a string before creating a RegExp object
-							if (regexObj.regex) {
-								// Create a RegExp object with the 'g' flag for global replacement
-								// The 'i' flag (case-insensitivity) may be needed depending on your requirement.
-								const colorRegex = new RegExp(regexObj.regex, 'g'); 
-								const colorStyle = `background-color: ${regexObj.color}; padding: 0;`;
-
-								// Replace all matches with a <mark> tag using the specified color
-								processedHtml = processedHtml.replace(colorRegex, (match) => {
-									return `<mark style="${colorStyle}">${match}</mark>`;
-								});
-							}
-						}
-					}
-					return processedHtml;
-				});
-
-				// 2. Handle the primary search highlight (this.searchRegex).
-				if (!this.searchRegex) {
-					// Fast path: No primary search, return the color-highlighted HTML string.
-					return colorHighlightedItems.join('');
-				}
-
-				// Primary Search is active: Map over the color-highlighted array to apply the primary highlight.
-				return colorHighlightedItems.map((itemHtml, index) => {
-					const itemIndex = startIndex + index; // The absolute index in this.items
-
-					// Distinguish the currently found item (scrolled to) from other matches.
-					const highlightClass = (itemIndex === this.lastFoundIndex) ? 'search-found' : 'search-highlight';
-
-					// Apply the highlight using String.prototype.replace.
-					// Note: The 'g' flag on this.searchRegex ensures all matches in the item are replaced.
-					// The primary search will now wrap any existing color highlights if the pattern includes them.
-					return itemHtml.replace(this.searchRegex, (match) => {
-						return `<mark class="${highlightClass}">${match}</mark>`;
-					});
-				}).join('');
+			setEscapeHtml(value) {
+				this.escapeHtml = !!value;
 			}
 
-			_getHighlightedHtml(startIndex, endIndex) {
-				return this._getHighlightedHtml_faster_approximate(startIndex, endIndex);
+			/**
+		     * Applies color rules and the primary search highlight to a plain text
+		     * string and returns a DocumentFragment. Works on TEXT ONLY (never on
+		     * markup), so a regex that matches tag/attribute text can no longer
+		     * corrupt the rendered HTML.
+		     */
+			_applyTextHighlights(text, itemIndex) {
+				const frag = document.createDocumentFragment();
+				const len = text.length;
+				if (len === 0) return frag;
+
+				// Per-character style descriptor. Higher-priority passes overwrite
+				// earlier ones, so the primary search wins over color rules.
+				const styles = new Array(len).fill(null);
+
+				const applyRegex = (regexStr, makeDescriptor) => {
+					let re;
+					try {
+						// Case-insensitive ('i') and global ('g'), matching the search behavior.
+						re = new RegExp(regexStr, 'gi');
+					} catch (e) {
+						console.warn('VirtualScroller: invalid regex, skipping highlight:', regexStr, e);
+						return;
+					}
+					let match;
+					while ((match = re.exec(text)) !== null) {
+						if (match[0] === '') { re.lastIndex++; continue; }
+						const descriptor = makeDescriptor();
+						for (let k = match.index; k < match.index + match[0].length; k++) {
+							styles[k] = descriptor;
+						}
+					}
+				};
+
+				// 1. Color rules (lower priority).
+				if (this.arRegexColors && this.arRegexColors.length > 0) {
+					for (const regexObj of this.arRegexColors) {
+						if (regexObj && regexObj.regex) {
+							applyRegex(regexObj.regex, () => ({ type: 'color', color: regexObj.color }));
+						}
+					}
+				}
+
+				// 2. Primary search highlight (higher priority).
+				if (this.searchRegex) {
+					const className = (itemIndex === this.lastFoundIndex) ? 'search-found' : 'search-highlight';
+					applyRegex(this.searchRegex.source, () => ({ type: 'search', className }));
+				}
+
+				const sameStyle = (a, b) => {
+					if (a === b) return true;
+					if (!a || !b) return false;
+					return a.type === b.type && a.color === b.color && a.className === b.className;
+				};
+
+				// Merge runs of identically-styled characters into <mark> elements.
+				let i = 0;
+				while (i < len) {
+					const descriptor = styles[i];
+					let j = i + 1;
+					while (j < len && sameStyle(styles[j], descriptor)) j++;
+
+					const textNode = document.createTextNode(text.slice(i, j));
+					if (!descriptor) {
+						frag.appendChild(textNode);
+					} else if (descriptor.type === 'search') {
+						const mark = document.createElement('mark');
+						mark.className = descriptor.className;
+						mark.appendChild(textNode);
+						frag.appendChild(mark);
+					} else {
+						const mark = document.createElement('mark');
+						mark.style.backgroundColor = descriptor.color;
+						mark.style.padding = '0';
+						mark.appendChild(textNode);
+						frag.appendChild(mark);
+					}
+					i = j;
+				}
+
+				return frag;
+			}
+
+			/**
+		     * Parses a single item's HTML string and returns a DocumentFragment with
+		     * highlighting applied to its text nodes only.
+		     */
+			_buildHighlightedItem(htmlStr, itemIndex) {
+				const template = document.createElement('template');
+				template.innerHTML = htmlStr;
+
+				// Fast path: nothing to highlight, keep the parsed node as-is.
+				const hasColorRules = this.arRegexColors && this.arRegexColors.length > 0;
+				if (!this.searchRegex && !hasColorRules) {
+					return template.content;
+				}
+
+				const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT, null);
+				const textNodes = [];
+				let node;
+				while ((node = walker.nextNode())) textNodes.push(node);
+
+				for (const textNode of textNodes) {
+					const replacement = this._applyTextHighlights(textNode.nodeValue || '', itemIndex);
+					if (textNode.parentNode) {
+						textNode.parentNode.replaceChild(replacement, textNode);
+					}
+				}
+
+				return template.content;
 			}
 
 			/**
@@ -705,16 +862,29 @@
 		     * @param {number} startIndex - The starting index of the content to render.
 		     * @param {number} endIndex - The ending index (exclusive).
 		     */
-		    _renderContent(startIndex, endIndex) {
-		        const offset = this.getOffsetForIndex(startIndex);
-		        //this.contentWindow.style.transform = `translateY(${offset}px)`;
-				this.contentWindow.style.transform = '';
-				this.contentWindow.style.top = `${offset}px`;
-		        
-		        // Integration of _getHighlightedHtml helper
-		        const finalHtml = this._getHighlightedHtml(startIndex, endIndex);
-		        this.contentWindow.innerHTML = finalHtml;
-		    }
+			     _renderContent(startIndex, endIndex) {
+			        const offset = this.getOffsetForIndex(startIndex);
+					this.contentWindow.style.transform = '';
+
+			        // Position the window relative to the logical viewport. It scrolls
+			        // with the content, so when the scrollbar is compressed (factor < 1)
+			        // we compensate by the gap between the logical and physical scroll
+			        // positions. When factor === 1 this reduces to `offset`, as before.
+			        const physicalScrollTop = this.viewport.scrollTop;
+			        const factor = this.scrollFactor();
+			        const logicalScrollTop = factor > 0 ? physicalScrollTop / factor : 0;
+			        const top = offset - logicalScrollTop + physicalScrollTop;
+					this.contentWindow.style.top = `${top}px`;
+
+			        // Build text-node-safe highlighted DOM for the range and mount it.
+			        const fragment = document.createDocumentFragment();
+			        const end = Math.min(endIndex, this.items.length);
+			        for (let i = startIndex; i < end; i++) {
+			            fragment.appendChild(this._buildHighlightedItem(this.items[i], i));
+			        }
+			        this.contentWindow.innerHTML = '';
+			        this.contentWindow.appendChild(fragment);
+			    }
 
 			/**
 		     * Orchestrates the rendering cycle: calculates range, renders content,
@@ -722,7 +892,10 @@
 		     */
 		    renderVisibleItems() {
 		        if (!this.viewport) return;
-		        const scrollTop = this.viewport.scrollTop;
+		        // The viewport reports a physical scroll offset; the range math below
+		        // operates in logical content coordinates, so convert once here.
+		        const physicalScrollTop = this.viewport.scrollTop;
+		        const scrollTop = this.physicalToLogical(physicalScrollTop);
 		        const VIEWPORT_HEIGHT = this.viewport.clientHeight;
 
 		        // 1. Calculate the initial render range (using fast incremental search).
@@ -755,6 +928,13 @@
 		        // 5. Cache state for the next scroll event.
 		        this.lastScrollTop = scrollTop;
 		        this.lastStartIndex = startIndex;
+
+		        // 6. Track whether the view is pinned to the bottom. Scrolling up stops
+		        // following just like pressing Pause, so the host UI can reflect both
+		        // cases through the same "not following" state.
+		        const logicalMaxScroll = Math.max(0, this.totalHeight - this.viewport.clientHeight);
+		        this.atBottom = scrollTop >= logicalMaxScroll - (this.estimatedHeight * 2);
+		        this._updateFollowingState();
 		    }
 
 		    
@@ -867,25 +1047,24 @@
 
             handleKeyDown(event) {
                 // Handle keyboard navigation: Page Up/Down, Ctrl+Home/End, arrow keys.
-                // These allow users to scroll without touching the mouse.
-                // Helper: compute a robust maximum scrollTop using the spacer's
-                // current offsetHeight (more reliable than `totalHeight` when
-                // measurements update asynchronously).
-                const maxScroll = Math.max(0, ((this.spacer && this.spacer.offsetHeight) ? this.spacer.offsetHeight : this.totalHeight) - this.viewport.clientHeight);
+                // Navigation is computed in logical (content) coordinates and then
+                // mapped back to a physical scroll position, so the on-screen step
+                // size stays constant even when the scrollbar is compressed.
+                const factor = this.scrollFactor();
+                const logicalScrollTop = factor > 0 ? this.viewport.scrollTop / factor : 0;
+                const logicalMax = Math.max(0, this.totalHeight - this.viewport.clientHeight);
+                const toPhysical = (logical) => this.logicalToPhysical(Math.max(0, Math.min(logicalMax, logical)));
 
                 switch (event.key) {
                     case 'PageUp':
                         // Scroll up by one viewport height
                         event.preventDefault();
-                        this.viewport.scrollTop = Math.max(0, this.viewport.scrollTop - this.viewport.clientHeight);
+                        this.viewport.scrollTop = toPhysical(logicalScrollTop - this.viewport.clientHeight);
                         break;
                     case 'PageDown':
                         // Scroll down by one viewport height
                         event.preventDefault();
-                        this.viewport.scrollTop = Math.min(
-                            maxScroll,
-                            this.viewport.scrollTop + this.viewport.clientHeight
-                        );
+                        this.viewport.scrollTop = toPhysical(logicalScrollTop + this.viewport.clientHeight);
                         break;
                     case 'Home':
                         // Ctrl+Home jumps to the start
@@ -898,21 +1077,18 @@
                         // Ctrl+End jumps to the end
                         if (event.ctrlKey) {
                             event.preventDefault();
-                            this.viewport.scrollTop = maxScroll;
+                            this.viewport.scrollTop = toPhysical(logicalMax);
                         }
                         break;
                     case 'ArrowUp':
                         // Scroll up by a small amount (half estimated line height)
                         event.preventDefault();
-                        this.viewport.scrollTop = Math.max(0, this.viewport.scrollTop - this.estimatedHeight / 2);
+                        this.viewport.scrollTop = toPhysical(logicalScrollTop - this.estimatedHeight / 2);
                         break;
                     case 'ArrowDown':
                         // Scroll down by a small amount (half estimated line height)
                         event.preventDefault();
-                        this.viewport.scrollTop = Math.min(
-                            maxScroll,
-                            this.viewport.scrollTop + this.estimatedHeight / 2
-                        );
+                        this.viewport.scrollTop = toPhysical(logicalScrollTop + this.estimatedHeight / 2);
                         break;
                 }
             }
@@ -922,7 +1098,9 @@
                 const currentWidth = this.viewport.clientWidth;
                 if (currentWidth === this.lastKnownViewportWidth) return;
 
-                const currentScrollTop = this.viewport.scrollTop;
+                // Preserve the logical (content) scroll position across the resize.
+                const factor = this.scrollFactor();
+                const logicalScrollTop = factor > 0 ? this.viewport.scrollTop / factor : 0;
                 clearTimeout(this.resizeTimer);
 
                 this.resizeTimer = setTimeout(() => {
@@ -938,32 +1116,38 @@
 
                     this.totalHeight = newTotalHeight;
                     this.lastKnownViewportWidth = currentWidth;
-                    const newScrollTop = currentScrollTop * scaleFactor;
+                    const newLogicalScrollTop = logicalScrollTop * scaleFactor;
 
                     // Rebuild cumulative heights after resize
                     this.rebuildCumulativeHeights();
                     // Reset position trackers since heights changed
-                    this.lastScrollTop = newScrollTop;
+                    this.lastScrollTop = newLogicalScrollTop;
                     this.lastStartIndex = 0;
                     this.updateSpacerHeight();
+                    // Map the logical position onto the (possibly compressed) physical scroll.
+                    this.viewport.scrollTop = this.logicalToPhysical(newLogicalScrollTop);
                     this.renderVisibleItems();
-                    this.viewport.scrollTop = newScrollTop;
                 }, 100);
             }
 
             getDebugInfo() {
                 // Return debugging information about the current scroller state.
                 // Developers can call this to display or log scroller metrics.
-                const scrollTop = this.viewport.scrollTop;
+                const physicalScrollTop = this.viewport.scrollTop;
+                const factor = this.scrollFactor();
+                const scrollTop = factor > 0 ? physicalScrollTop / factor : 0;
                 const startIndex = this.lastStartIndex;
                 const endIndex = Math.min(this.items.length, startIndex + Math.ceil(this.viewport.clientHeight / this.estimatedHeight) + this.overscan);
                 return {
                     totalItems: this.items.length,
                     totalHeight: this.totalHeight,
+                    spacerHeight: this.physicalHeight(),
                     viewportHeight: this.viewport.clientHeight,
                     scrollTop: scrollTop,
                     visibleRange: `${startIndex} - ${endIndex}`,
                     renderingItems: Math.max(0, endIndex - startIndex),
+                    compressed: factor < 1,
+                    scrollFactor: factor,
                     paused: this.paused
                 };
             }
@@ -973,7 +1157,8 @@
         // Instantiate the scroller with only the viewport ID; all child elements are auto-discovered
         const scroller = new VirtualScroller('virtual-viewport', {
             estimatedHeight: ESTIMATED_ITEM_HEIGHT,
-            overscan: OVERSCAN_COUNT
+            overscan: OVERSCAN_COUNT,
+            onFollowChange: updateFollowUI
         });
 
 		function updateRegexColorsFromStorage() {
@@ -1174,7 +1359,8 @@
 
 				logSSE.onmessage = function(event) {
 					const text = event.data;
-					const html = `<div class="scroller-item">${text}</div>`;
+					const content = scroller.escapeHtml ? escapeHtml(text) : text;
+					const html = `<div class="scroller-item">${content}</div>`;
 					scroller.add_html(html);
 					let stats = scroller.getStats();
 					displayStats(stats);
@@ -1204,6 +1390,16 @@
             } else {
                 return element.textContent;
             }
+        }
+
+        function escapeHtml(text) {
+            return String(text).replace(/[&<>"']/g, (ch) => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            }[ch]));
         }
 
         /**
@@ -1626,16 +1822,19 @@
             return { [containerElement.id]: data };
         }
 
+		// Reflect the scroller's follow state in the UI. "not following" covers
+		// both an explicit pause and the user having scrolled away from the bottom.
+		function updateFollowUI(following) {
+			document.getElementById('pause-btn').style.display = following ? 'inline-block' : 'none';
+			document.getElementById('resume-btn').style.display = following ? 'none' : 'inline-block';
+		}
+
 		function pauseScroller() {
 			scroller.pause();
-			document.getElementById('pause-btn').style.display = 'none';
-			document.getElementById('resume-btn').style.display = 'inline-block';
 		}
 
 		function resumeScroller() {
 			scroller.continue();
-			document.getElementById('resume-btn').style.display = 'none';
-			document.getElementById('pause-btn').style.display = 'inline-block';
 		}
 
 		function displayStats(stats) {
